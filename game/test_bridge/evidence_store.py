@@ -1,0 +1,256 @@
+"""Append-only JSONL and SQLite evidence for Phase 2 test runs."""
+
+from __future__ import annotations
+
+import json
+import platform
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+
+
+def _utc_now() -> str:
+    """Return an ISO-8601 UTC timestamp with an explicit Z suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _json(value: Any) -> str:
+    """Serialize structured columns deterministically for later comparison."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def new_run_id(tool: str) -> str:
+    """Create a readable globally unique run identifier."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{tool}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+class EvidenceStore:  # pylint: disable=too-many-instance-attributes
+    """Write every evidence event to JSONL and SQLite from one payload."""
+
+    def __init__(
+        self,
+        root: Path,
+        tool: str,
+        *,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.tool = tool
+        self.run_id = run_id or new_run_id(tool)
+        self.jsonl_path = self.root / f"{self.run_id}.jsonl"
+        self.sqlite_path = self.root / "phase2_evidence.sqlite3"
+        self.started_at = _utc_now()
+        self._sequence = 0
+        self._finished = False
+        self._connection = sqlite3.connect(self.sqlite_path)
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._create_schema()
+
+        run_metadata = {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            **(metadata or {}),
+        }
+        self._connection.execute(
+            """
+            INSERT INTO runs (
+                run_id, schema_version, tool, started_at, status, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.run_id,
+                SCHEMA_VERSION,
+                self.tool,
+                self.started_at,
+                "running",
+                _json(run_metadata),
+            ),
+        )
+        self._connection.commit()
+        self.record("run_started", name=self.tool, status="running", details=run_metadata)
+
+    def _create_schema(self) -> None:
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                tool TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                total INTEGER,
+                passed INTEGER,
+                failed INTEGER,
+                skipped INTEGER,
+                other INTEGER,
+                duration_ms REAL,
+                metadata_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                name TEXT,
+                status TEXT,
+                duration_ms REAL,
+                error_type TEXT,
+                message TEXT,
+                request_id TEXT,
+                command_id TEXT,
+                session_id TEXT,
+                world_generation TEXT,
+                state_version INTEGER,
+                event_sequence INTEGER,
+                details_json TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(run_id),
+                UNIQUE (run_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS evidence_events_run_type_idx
+            ON evidence_events (run_id, event_type, status);
+            """
+        )
+        self._connection.commit()
+
+    def record(  # pylint: disable=too-many-locals
+        self,
+        event_type: str,
+        *,
+        name: str | None = None,
+        status: str | None = None,
+        duration_ms: float | None = None,
+        error_type: str | None = None,
+        message: str | None = None,
+        request_id: str | None = None,
+        command_id: str | None = None,
+        session_id: str | None = None,
+        world_generation: str | None = None,
+        state_version: int | None = None,
+        event_sequence: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append one normalized event and return the exact JSONL payload."""
+        if self._finished:
+            raise RuntimeError("cannot append evidence after the run has finished")
+
+        self._sequence += 1
+        payload = {
+            "schemaVersion": SCHEMA_VERSION,
+            "eventId": str(uuid.uuid4()),
+            "runId": self.run_id,
+            "sequence": self._sequence,
+            "recordedAt": _utc_now(),
+            "tool": self.tool,
+            "eventType": event_type,
+            "name": name,
+            "status": status,
+            "durationMs": duration_ms,
+            "errorType": error_type,
+            "message": message,
+            "requestId": request_id,
+            "commandId": command_id,
+            "sessionId": session_id,
+            "worldGeneration": world_generation,
+            "stateVersion": state_version,
+            "eventSequence": event_sequence,
+            "details": details or {},
+        }
+        with self.jsonl_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(_json(payload) + "\n")
+
+        self._connection.execute(
+            """
+            INSERT INTO evidence_events (
+                event_id, run_id, sequence, recorded_at, event_type, name, status,
+                duration_ms, error_type, message, request_id, command_id,
+                session_id, world_generation, state_version, event_sequence,
+                details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["eventId"],
+                payload["runId"],
+                payload["sequence"],
+                payload["recordedAt"],
+                payload["eventType"],
+                payload["name"],
+                payload["status"],
+                payload["durationMs"],
+                payload["errorType"],
+                payload["message"],
+                payload["requestId"],
+                payload["commandId"],
+                payload["sessionId"],
+                payload["worldGeneration"],
+                payload["stateVersion"],
+                payload["eventSequence"],
+                _json(payload["details"]),
+            ),
+        )
+        self._connection.commit()
+        return payload
+
+    def finish(
+        self,
+        *,
+        status: str,
+        total: int,
+        passed: int,
+        failed: int,
+        skipped: int,
+        other: int,
+        duration_ms: float,
+    ) -> None:
+        """Write the terminal event and finalize the matching run row."""
+        summary = {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "other": other,
+        }
+        self.record(
+            "run_finished",
+            name=self.tool,
+            status=status,
+            duration_ms=duration_ms,
+            details=summary,
+        )
+        finished_at = _utc_now()
+        self._connection.execute(
+            """
+            UPDATE runs
+            SET finished_at = ?, status = ?, total = ?, passed = ?, failed = ?,
+                skipped = ?, other = ?, duration_ms = ?
+            WHERE run_id = ?
+            """,
+            (
+                finished_at,
+                status,
+                total,
+                passed,
+                failed,
+                skipped,
+                other,
+                duration_ms,
+                self.run_id,
+            ),
+        )
+        self._connection.commit()
+        self._finished = True
+        self._connection.close()

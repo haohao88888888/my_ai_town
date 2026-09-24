@@ -50,6 +50,9 @@ const TOUCH_CAMERA_GESTURE := preload(
 const MOBILE_MOVEMENT_INPUT := preload(
 	"res://ui/mobile/MobileMovementInput.gd"
 )
+const CHARACTER_MOVEMENT_QUERY := preload(
+	"res://world/data/town/TownWorldCharacterMovementQuery.gd"
+)
 # 表现层激活空间与实际可视空间的周期兜底核对间隔（秒）。
 const SPACE_VIEW_SYNC_INTERVAL_SECONDS := 0.5
 const RESIDENT_WARDROBE_CATALOG_PATH := (
@@ -1418,6 +1421,64 @@ func set_avatar_movement_input_enabled(enabled: bool) -> Dictionary:
 
 func set_virtual_movement_input(value: Vector2) -> void:
 	_mobile_movement_input.set_value(value)
+
+
+func get_avatar_movement_state() -> Dictionary:
+	var avatar := _world.get_player_avatar_state() as Dictionary if _world != null else {}
+	return {
+		"avatarMode": _avatar_mode,
+		"present": bool(avatar.get("present", false)),
+		"spaceId": String(avatar.get("spaceId", "")),
+		"position": _avatar_world_position() if enable_player_avatar else avatar.get("position", Vector2.ZERO),
+		"confirmedPosition": avatar.get("position", Vector2.ZERO),
+		"movementInputEnabled": (
+			_avatar_movement_input_enabled
+			and not _avatar_conflict_input_blocked
+		),
+		"transitionActive": _avatar_place_change_active or _portal_transition_active,
+		"paused": _world != null and _world.is_paused(),
+	}
+
+
+func validate_virtual_movement_target(space_id: String, target: Vector2) -> Dictionary:
+	if _world == null or not _world.is_running():
+		return {"ok": false, "errorCode": "WORLD_NOT_RUNNING"}
+	if not target.is_finite():
+		return {"ok": false, "errorCode": "TARGET_POSITION_INVALID"}
+	var avatar := _world.get_player_avatar_state() as Dictionary
+	if space_id != String(avatar.get("spaceId", "")):
+		return {"ok": false, "errorCode": "SPACE_CONFLICT"}
+	# External movement requires the exact target to be legal. Do not use the
+	# fallback search here: an arbitrary invalid target must not trigger a whole-
+	# map nearest-point scan on the game thread.
+	var safe := CHARACTER_MOVEMENT_QUERY.safe_position(
+		_read_json(WORLD_DATA_PATH),
+		space_id,
+		target,
+	) as Dictionary
+	if safe.is_empty():
+		return {"ok": false, "errorCode": "TARGET_NOT_WALKABLE"}
+	return {
+		"ok": true,
+		"spaceId": space_id,
+		"position": target,
+		"placeName": String(safe.get("placeName", "")),
+		"regionId": String(safe.get("regionId", "")),
+	}
+
+
+func stop_virtual_movement_and_sync() -> Dictionary:
+	_mobile_movement_input.clear()
+	_player.velocity = Vector2.ZERO
+	if not enable_player_avatar or _world == null:
+		return {"ok": true, "synced": false}
+	_stop_avatar_visual_motion(false)
+	var result := _submit_player_avatar_position(true)
+	return {
+		"ok": bool(result.get("ok", false)),
+		"synced": bool(result.get("ok", false)),
+		"result": result,
+	}
 
 
 func _read_move_input() -> Vector2:
@@ -3269,6 +3330,26 @@ func _on_runtime_world_restored(_summary: Dictionary) -> void:
 	# or agent decision event.
 	_sync_environment_space_occupancy()
 	_sync_building_resident_markers()
+	_prioritize_restored_resident_conversation()
+
+
+func _prioritize_restored_resident_conversation() -> void:
+	if _world == null or _agent_gateway == null:
+		return
+	var avatar_state := _world.get_player_avatar_state() as Dictionary
+	for conversation_value: Variant in _world.get_active_conversations() as Array:
+		if (
+			conversation_value is Dictionary
+			and _conversation_waits_for_resident(
+				conversation_value as Dictionary,
+				avatar_state,
+			)
+		):
+			# A save can contain the suspended action and unanswered conversation
+			# created before this scheduling fix. Re-open the priority lane on restore
+			# so that existing saves recover without waiting behind ordinary work.
+			_agent_gateway.prioritize_next_conversation_turn()
+			return
 
 
 func _on_runtime_player_avatar_place_changed(_change: Dictionary) -> void:
@@ -3311,7 +3392,31 @@ func _on_runtime_conversation_changed(conversation_id: String, state: Dictionary
 		if not cue.is_empty():
 			_play_audio_cue(cue)
 		_conversation_audio_turn_counts[conversation_id] = turns.size()
+	if (
+		_agent_gateway != null
+		and String(state.get("status", "")) == "active"
+		and _conversation_waits_for_resident(state, avatar_state)
+	):
+		# conversation_changed is emitted immediately before World queues the
+		# resident's reply event. Keep the admission flag set for the next frame so
+		# a resident-to-resident conversation can bypass ordinary preparation just
+		# like a player conversation instead of suspending the target indefinitely.
+		_agent_gateway.prioritize_next_conversation_turn()
 	_update_player_conversation_panel()
+
+
+static func _conversation_waits_for_resident(
+	state: Dictionary,
+	avatar_state: Dictionary,
+) -> bool:
+	var waiting_for := String(state.get("waitingFor", "")).strip_edges()
+	if waiting_for.is_empty():
+		return false
+	var avatar_name := String(avatar_state.get("name", "旅行者")).strip_edges()
+	var avatar_id := String(avatar_state.get("residentId", "")).strip_edges()
+	return waiting_for != avatar_name and (
+		avatar_id.is_empty() or waiting_for != avatar_id
+	)
 
 
 func _conversation_includes_avatar(

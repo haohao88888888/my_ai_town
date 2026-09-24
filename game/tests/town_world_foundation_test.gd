@@ -2738,6 +2738,21 @@ func _scenario_frame_work_budget() -> void:
 		1,
 		"each runtime frame admits at most one Agent request into the staged pipeline",
 	)
+	var avatar_state := {"name": "旅行者", "residentId": "player-avatar"}
+	_expect(
+		TOWN_RUNTIME._conversation_waits_for_resident(
+			{"status": "active", "waitingFor": "resident-hanako"},
+			avatar_state,
+		),
+		"resident-to-resident replies request priority admission",
+	)
+	_expect(
+		not TOWN_RUNTIME._conversation_waits_for_resident(
+			{"status": "active", "waitingFor": "player-avatar"},
+			avatar_state,
+		),
+		"waiting for player input does not consume the resident reply lane",
+	)
 	world.call("stop")
 
 

@@ -40,6 +40,11 @@ const AGENT_SAVE_STORE := preload(
 const OFFLINE_REBIND := preload(
 	"res://world/presentation/session/TownOfflineResidentModelRebindService.gd"
 )
+const PERSISTENCE_MEMORY_KEY := "phase2-persistence-memory"
+const PERSISTENCE_STATE_TASK_ID := "phase2-persistence-state-task"
+const PERSISTENCE_LOG_TASK_ID := "phase2-persistence-log-task"
+const PERSISTENCE_MEMORY_SAVED_TEXT := "存档前记住：明早去图书馆归还资料。"
+const PERSISTENCE_MEMORY_LIVE_TEXT := "存档后改成：明早留在家里整理资料。"
 
 var _failures: Array[String] = []
 var _checks := 0
@@ -69,7 +74,7 @@ func _run() -> void:
 	var selection_data := selection_vm.get("data", {}) as Dictionary
 	selection_data["selected_resident_ids"] = (
 		selection_data.get("recommended_resident_ids", []) as Array
-	).slice(0, 5)
+	).duplicate()
 	INTERNAL_CATALOG.update_confirmation_payload(
 		selection_data,
 		"fake",
@@ -87,7 +92,7 @@ func _run() -> void:
 		return
 	var bindings := compiled.get("residentBindings", []) as Array[Dictionary]
 	var identities := _identities(bindings)
-	_expect_equal(identities.size(), 5, "少人口闭环只包含五位居民")
+	_expect_equal(identities.size(), 15, "正式闭环包含完整十五位居民")
 	var request_host := Node.new()
 	request_host.name = "SaveContinueRoundtripRequestHost"
 	root.add_child(request_host)
@@ -137,6 +142,60 @@ func _run() -> void:
 	)
 	var source_world: RefCounted = source_runtime.call("get_world_runtime")
 	var source_agent: RefCounted = source_gateway.call("get_agent_save_participant")
+	var persistence_resident_id := (
+		String((identities[0] as Dictionary).get("residentId", ""))
+		if not identities.is_empty()
+		else ""
+	)
+	var memory_written := source_gateway.call(
+		"apply_resident_memory_intervention",
+		persistence_resident_id,
+		{
+			"memoryKey": PERSISTENCE_MEMORY_KEY,
+			"operation": "write",
+			"playerText": PERSISTENCE_MEMORY_SAVED_TEXT,
+			"expectedRevision": 0,
+		},
+	) as Dictionary
+	_expect_ok(memory_written, "真实居民记忆在保存前写入隔离会话")
+	var state_task := _prepare_persistence_task(
+		source_world,
+		PERSISTENCE_STATE_TASK_ID,
+		persistence_resident_id,
+		false,
+	)
+	_expect_ok(state_task, "保存前建立进行中的真实工作任务")
+	var log_task := _prepare_persistence_task(
+		source_world,
+		PERSISTENCE_LOG_TASK_ID,
+		persistence_resident_id,
+		true,
+	)
+	_expect_ok(log_task, "保存前完成真实工作任务并生成世界日志")
+	var saved_task_projection := _task_projection(
+		source_world,
+		PERSISTENCE_STATE_TASK_ID,
+	)
+	var saved_log_projection := _work_task_log_projection(
+		source_world,
+		PERSISTENCE_LOG_TASK_ID,
+	)
+	var saved_memory_projection := _memory_entry_projection(
+		source_gateway,
+		persistence_resident_id,
+		PERSISTENCE_MEMORY_KEY,
+	)
+	_expect_equal(
+		saved_task_projection.get("state"),
+		"in_progress",
+		"保存点任务状态为进行中",
+	)
+	_expect(not saved_log_projection.is_empty(), "保存点包含指定工作任务的世界日志")
+	_expect_equal(
+		saved_memory_projection.get("subject"),
+		PERSISTENCE_MEMORY_SAVED_TEXT,
+		"保存点可读回指定居民记忆",
+	)
 	var store: RefCounted = STORE.new()
 	_expect_ok(
 		store.call("configure_test_root", test_root) as Dictionary,
@@ -248,6 +307,52 @@ func _run() -> void:
 		3,
 		"正式发现入口只暴露已经发布的最新修订",
 	)
+	var current_memory := _resident_memory(
+		source_gateway,
+		persistence_resident_id,
+	)
+	var memory_edited := source_gateway.call(
+		"apply_resident_memory_intervention",
+		persistence_resident_id,
+		{
+			"memoryKey": PERSISTENCE_MEMORY_KEY,
+			"operation": "edit",
+			"playerText": PERSISTENCE_MEMORY_LIVE_TEXT,
+			"expectedRevision": int(current_memory.get(
+				"formal_memory_revision",
+				-1,
+			)),
+		},
+	) as Dictionary
+	_expect_ok(memory_edited, "保存后现场居民记忆可被改写")
+	var source_tasks: RefCounted = _work_tasks(source_world)
+	var cancelled := source_tasks.call(
+		"cancel_task",
+		PERSISTENCE_STATE_TASK_ID,
+		"phase2-post-save-mutation",
+	) as Dictionary
+	_expect_ok(cancelled, "保存后现场任务可变为取消状态")
+	_expect_equal(
+		_task_projection(source_world, PERSISTENCE_STATE_TASK_ID).get("state"),
+		"cancelled",
+		"保存后的现场状态确实偏离保存点",
+	)
+	_expect_equal(
+		_memory_entry_projection(
+			source_gateway,
+			persistence_resident_id,
+			PERSISTENCE_MEMORY_KEY,
+		).get("subject"),
+		PERSISTENCE_MEMORY_LIVE_TEXT,
+		"保存后的现场记忆确实偏离保存点",
+	)
+	_expect(
+		not _work_task_log_projection(
+			source_world,
+			PERSISTENCE_STATE_TASK_ID,
+		).is_empty(),
+		"保存后取消任务会产生只属于现场的新日志",
+	)
 
 	var damaged_manifest := manual_after_async.get("manifest", {}) as Dictionary
 	var damaged_world := (
@@ -314,8 +419,32 @@ func _run() -> void:
 	_expect_equal(restored_world.call("get_time"), saved_time, "恢复后世界时间与保存时一致")
 	_expect_equal(
 		(restored_world.call("get_resident_ids") as Array).size(),
-		5,
-		"恢复后仍是原有五位居民",
+		15,
+		"恢复后仍是原有十五位居民",
+	)
+	_expect_equal(
+		_task_projection(restored_world, PERSISTENCE_STATE_TASK_ID),
+		saved_task_projection,
+		"恢复后任务回到保存点的进行中状态与修订",
+	)
+	_expect_equal(
+		_work_task_log_projection(restored_world, PERSISTENCE_LOG_TASK_ID),
+		saved_log_projection,
+		"恢复后世界日志保留保存点的任务记录",
+	)
+	_expect_equal(
+		_work_task_log_projection(restored_world, PERSISTENCE_STATE_TASK_ID),
+		[],
+		"恢复后不会混入保存点之后的任务取消日志",
+	)
+	_expect_equal(
+		_memory_entry_projection(
+			restore_gateway,
+			persistence_resident_id,
+			PERSISTENCE_MEMORY_KEY,
+		),
+		saved_memory_projection,
+		"恢复后居民记忆回到保存点内容而非现场改写内容",
 	)
 	_expect_equal(
 		restore_gateway.call("get_agent_save_context"),
@@ -357,7 +486,7 @@ func _run() -> void:
 	var resaved := restore_service.call("create_save", {
 		"residentMessages": [],
 	}) as Dictionary
-	_expect_ok(resaved, "五人存档恢复后可以再次成对保存")
+	_expect_ok(resaved, "十五人存档恢复后可以再次成对保存")
 	_expect_equal(
 		(resaved.get("context", {}) as Dictionary).get("save_revision"),
 		5,
@@ -365,7 +494,7 @@ func _run() -> void:
 	)
 	_expect_equal(
 		(restored_world.call("get_resident_ids") as Array).size(),
-		5,
+		15,
 		"再次保存不会补出未选择的居民",
 	)
 
@@ -940,6 +1069,165 @@ func _verify_recovery_publication(
 		"再次启动不再重复生成同一修复计划",
 	)
 	return (repaired.get("context", {}) as Dictionary).duplicate(true)
+
+
+func _prepare_persistence_task(
+	world: RefCounted,
+	task_id: String,
+	resident_id: String,
+	complete: bool,
+) -> Dictionary:
+	var tasks := _work_tasks(world)
+	if tasks == null:
+		return {"ok": false, "errorCode": "TEST_WORK_TASK_RUNTIME_MISSING"}
+	var created := tasks.call("create_task", {
+		"taskId": task_id,
+		"capability": "library.accession",
+		"sourceKind": "research_handoff",
+		"sourceRef": "%s-source" % task_id,
+		"targets": [{"kind": "prop", "ref": "图书馆归还书台"}],
+		"requestedResultKind": "accession_record",
+		"createdAtMinute": 0,
+		"priority": 73,
+	}) as Dictionary
+	if created.get("ok") != true:
+		return created
+	var scoped := tasks.call(
+		"add_eligible_residents",
+		task_id,
+		[resident_id],
+	) as Dictionary
+	if scoped.get("ok") != true:
+		return scoped
+	var scoped_task := scoped.get("task", {}) as Dictionary
+	var occupation_ids := scoped_task.get("eligibleOccupationIds", []) as Array
+	var occupation_id := String(occupation_ids[0]) if not occupation_ids.is_empty() else ""
+	var accepted := tasks.call(
+		"accept_task",
+		task_id,
+		resident_id,
+		occupation_id,
+		int(scoped_task.get("revision", 0)),
+	) as Dictionary
+	if accepted.get("ok") != true:
+		return accepted
+	var accepted_task := accepted.get("task", {}) as Dictionary
+	var started := tasks.call(
+		"start_task",
+		task_id,
+		resident_id,
+		int(accepted_task.get("revision", 0)),
+	) as Dictionary
+	if started.get("ok") != true or not complete:
+		return started
+	var started_task := started.get("task", {}) as Dictionary
+	return tasks.call(
+		"complete_task",
+		task_id,
+		resident_id,
+		int(started_task.get("revision", 0)),
+		"accession_record",
+		{
+			"resultRef": "%s-result" % task_id,
+			"facts": {"fixture": "phase2-persistence"},
+		},
+	) as Dictionary
+
+
+func _work_tasks(world: RefCounted) -> RefCounted:
+	var work_domain: Variant = world.get("work_domain")
+	if not work_domain is RefCounted:
+		return null
+	var tasks: Variant = (work_domain as RefCounted).get("tasks")
+	return tasks as RefCounted if tasks is RefCounted else null
+
+
+func _task_projection(world: RefCounted, task_id: String) -> Dictionary:
+	var tasks := _work_tasks(world)
+	if tasks == null:
+		return {}
+	var task := tasks.call("task", task_id) as Dictionary
+	if task.is_empty():
+		return {}
+	return {
+		"taskId": String(task.get("taskId", "")),
+		"state": String(task.get("state", "")),
+		"revision": int(task.get("revision", 0)),
+		"assignedResidentId": String(task.get("assignedResidentId", "")),
+		"assignedOccupationId": String(task.get("assignedOccupationId", "")),
+		"processStage": String(task.get("processStage", "")),
+		"requestedResultKind": String(task.get("requestedResultKind", "")),
+	}
+
+
+func _work_task_log_projection(
+	world: RefCounted,
+	task_id: String,
+) -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var threads := world.call("query_world_log_threads", {"limit": 200}) as Dictionary
+	if threads.get("ok") != true:
+		return result
+	for row_value: Variant in threads.get("rows", []) as Array:
+		if not row_value is Dictionary:
+			continue
+		var row := row_value as Dictionary
+		var detail := world.call(
+			"get_world_log_thread_detail",
+			String(row.get("threadId", "")),
+			{"limit": 500},
+		) as Dictionary
+		if detail.get("ok") != true:
+			continue
+		for record_value: Variant in detail.get("records", []) as Array:
+			if not record_value is Dictionary:
+				continue
+			var record := record_value as Dictionary
+			var payload := record.get("payload", {}) as Dictionary
+			if String(payload.get("taskId", "")) != task_id:
+				continue
+			result.append({
+				"taskId": String(payload.get("taskId", "")),
+				"taskRevision": int(payload.get("taskRevision", 0)),
+				"status": String(payload.get("status", "")),
+				"capability": String(payload.get("capability", "")),
+				"sourceKind": String(payload.get("sourceKind", "")),
+				"sourceRef": String(payload.get("sourceRef", "")),
+			})
+	result.sort_custom(func(left: Dictionary, right: Dictionary) -> bool:
+		return int(left.get("taskRevision", 0)) < int(right.get("taskRevision", 0))
+	)
+	return result
+
+
+func _resident_memory(gateway: Node, resident_id: String) -> Dictionary:
+	var response := gateway.call("get_resident_memory", resident_id) as Dictionary
+	if response.get("ok") != true:
+		return {}
+	return (response.get("memory", {}) as Dictionary).duplicate(true)
+
+
+func _memory_entry_projection(
+	gateway: Node,
+	resident_id: String,
+	memory_key: String,
+) -> Dictionary:
+	var memory := _resident_memory(gateway, resident_id)
+	for entry_value: Variant in memory.get("formal_memories", []) as Array:
+		if not entry_value is Dictionary:
+			continue
+		var entry := entry_value as Dictionary
+		if String(entry.get("memoryKey", "")) != memory_key:
+			continue
+		return {
+			"memoryKey": String(entry.get("memoryKey", "")),
+			"subject": String(entry.get("subject", "")),
+			"sourceKind": String(entry.get("sourceKind", "")),
+			"confidence": int(entry.get("confidence", 0)),
+			"state": String(entry.get("state", "")),
+			"worldTime": (entry.get("worldTime", {}) as Dictionary).duplicate(true),
+		}
+	return {}
 
 
 func _wait_for_async_save(service: RefCounted) -> Dictionary:
