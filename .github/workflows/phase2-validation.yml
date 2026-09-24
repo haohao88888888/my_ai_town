@@ -1,4 +1,4 @@
-# Updated: 2026-09-24 17:27:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-24 17:30:00 +08:00 (Asia/Shanghai)
 name: phase2-validation
 
 on:
@@ -27,7 +27,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11.16'
+          python-version: '3.11.9'
 
       - uses: actions/setup-node@v4
         with:

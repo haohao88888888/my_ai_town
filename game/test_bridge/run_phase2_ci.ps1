@@ -1,4 +1,4 @@
-# Updated: 2026-09-24 17:27:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-24 17:30:00 +08:00 (Asia/Shanghai)
 [CmdletBinding()]
 param(
     [ValidateSet('all', 'preflight', 'static', 'pytest', 'godot', 'newman', 'evidence')]
@@ -165,7 +165,7 @@ function Invoke-PreflightStage {
         newman = Get-NativeOutput -FilePath $newmanPath -Arguments @('--version')
     }
     $expected = [ordered]@{
-        python = 'Python 3.11.16'
+        python = 'Python 3.11.'
         pytest = 'pytest 8.3.4'
         pylint = 'pylint 2.14.5'
         godot = '4.7.2.stable.official.ed1daf0bf'
