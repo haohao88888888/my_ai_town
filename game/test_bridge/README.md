@@ -1,4 +1,4 @@
-> 更新时间：2026-09-25 10:16 +08:00（Asia/Shanghai）
+> 更新时间：2026-09-25 10:50 +08:00（Asia/Shanghai）
 
 # GameTestBridge：阶段 1 外部测试桥
 
@@ -316,7 +316,7 @@ sqlite3 -header -column 'game/test_bridge/artifacts/phase2_evidence.sqlite3' "SE
 
 ## 阶段 2 CI：GitHub Actions 与本机复跑
 
-`.github/workflows/phase2-validation.yml` 使用 GitHub 托管 Windows runner，安装固定版本的 Python `3.11.9`、Node/Newman 和 Godot，再调用同一个 `run_phase2_ci.ps1` 执行预检、静态分析、pytest、Godot Headless 和 Newman。本机 Conda 使用 Python `3.11.16`；两者同属 3.11 系列，报告记录实际补丁版本，不伪称二进制完全一致。所有阶段结果汇总为 `*-ci-summary.json` 并导入 JSONL/SQLite；JUnit、日志和摘要作为 Actions artifact 保留 7 天。历史 Jenkins 摘要导入入口保留用于读取旧证据，不代表继续使用 Jenkins。
+`.github/workflows/phase2-validation.yml` 仍使用 GitHub Actions 托管 Windows runner，分为两个职责明确的 job：`bridge-regression` 安装核心依赖、固定版本 Python `3.11.9`、Node/Newman 和 Godot，调用同一个 `run_phase2_ci.ps1` 执行预检、核心 Python 静态分析、pytest、Godot Headless 和 Newman；`locust-static` 另装核心加 Locust 依赖，检查 Locust 场景的语法和导入。两者目前都在每次工作流触发时执行，不使用 `paths` 跳过必需检查；Locust job 只是静态检查，不冒充 1/5 客户端并发实跑。本机 Conda 使用 Python `3.11.16`；两者同属 3.11 系列，报告记录实际补丁版本，不伪称二进制完全一致。核心阶段结果汇总为 `*-ci-summary.json` 并导入 JSONL/SQLite；JUnit、日志、摘要和独立的 Locust 静态日志作为 Actions artifact 保留 7 天。历史 Jenkins 摘要导入入口保留用于读取旧证据，不代表继续使用 Jenkins。
 
 本机在仓库根目录运行（证据目录必须已存在）：
 
@@ -329,3 +329,5 @@ sqlite3 -header -column 'game/test_bridge/artifacts/phase2_evidence.sqlite3' "SE
 2026-09-24 本机整链结果：首次运行在 Pylint 命名检查失败并保留摘要；修正后第二次运行 Pylint `10.00/10`、pytest `27 passed`、Godot `685 checks`、Newman `5 requests / 14 assertions / 0 failures`，并成功导入 CI 摘要。GitHub Actions 首次运行在 checkout 阶段因仓库内历史存档 fixture 的 Windows 长路径失败；第二次在 Python 安装阶段发现 Windows runner 不提供本机的 `3.11.16`。工作流已改为 checkout 前启用 Git longpaths，并使用官方清单中 Windows x64 可安装的 `3.11.9`；后续远端运行结果仍须单独核对。
 
 2026-09-25 第三次远端运行已进入回归步骤，预检却在空证据目录中读取不存在的 `Measure-Object.Sum` 而失败。本机用现有空目录复现同一严格模式错误，修正后空目录为 `0` 字节、非空目录仍返回实际大小；整链 `local-actions-empty-evidence-fix` 再次完成 Pylint `10.00/10`、pytest `27 passed`、Godot `685 checks`、Newman `5 requests / 14 assertions / 0 failures` 和 CI 摘要导入。是否解决 runner 的首次空目录场景，以新提交的远端实跑为准。
+
+2026-09-25 下一次远端运行 [36085623192](https://github.com/haohao88888888/my_ai_town/actions/runs/36085623192) 的空目录预检已通过，但核心 Pylint 因未安装可选 Airtest/Locust 依赖而报 11 个导入错误。这是 CI 依赖与检查目标错位，不是业务回归失败。已将核心 Pylint 目标限制为核心模块、把 Locust 静态检查拆到独立 job；本机两个目标各为 `10.00/10`，PowerShell 语法与工作流 YAML 解析通过。远端是否通过、同一提交连续三次是否成功，仍以新工作流实跑为准。Airtest 的真实 UI 冒烟继续在本机前台执行，不作为无头 job 的通过项。

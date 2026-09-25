@@ -1,4 +1,4 @@
-# Updated: 2026-09-25 10:16:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-25 10:48:00 +08:00 (Asia/Shanghai)
 [CmdletBinding()]
 param(
     [ValidateSet('all', 'preflight', 'static', 'pytest', 'godot', 'newman', 'evidence')]
@@ -217,8 +217,6 @@ function Invoke-StaticStage {
         '-m', 'pylint',
         'game/test_bridge/evidence_store.py',
         'game/test_bridge/evidence_import.py',
-        'game/test_bridge/airtest_smoke.py',
-        'game/test_bridge/locust/locustfile.py',
         'game/test_bridge/phase2_tests'
     ) -LogPath $logPath -Append
     $script:stageReportPaths = @($logPath)

@@ -1,4 +1,4 @@
-# Updated: 2026-09-24 17:30:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-25 10:48:00 +08:00 (Asia/Shanghai)
 name: phase2-validation
 
 on:
@@ -74,5 +74,43 @@ jobs:
         with:
           name: phase2-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: game/test_bridge/artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+  locust-static:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Enable long Git paths before checkout
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+
+      - name: Install core and load-test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --requirement game/test_bridge/requirements-phase2-core.txt --requirement game/test_bridge/requirements-phase2-load.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check Locust scenario syntax and imports
+        shell: pwsh
+        run: |
+          python -m compileall -q game/test_bridge/locust
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pylint game/test_bridge/locust/locustfile.py 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'locust-static.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve Locust static report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-locust-static-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/locust-static.log
           if-no-files-found: warn
           retention-days: 7
