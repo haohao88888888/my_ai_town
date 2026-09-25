@@ -1,4 +1,4 @@
-# Updated: 2026-09-24 17:30:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-25 10:16:00 +08:00 (Asia/Shanghai)
 [CmdletBinding()]
 param(
     [ValidateSet('all', 'preflight', 'static', 'pytest', 'godot', 'newman', 'evidence')]
@@ -72,6 +72,9 @@ function Get-DirectoryBytes {
     }
     $measurement = Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue |
         Measure-Object -Property Length -Sum
+    if ($null -eq $measurement) {
+        return [int64]0
+    }
     return [int64]($measurement.Sum)
 }
 

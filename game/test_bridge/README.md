@@ -1,4 +1,4 @@
-> 更新时间：2026-09-24 17:30 +08:00（Asia/Shanghai）
+> 更新时间：2026-09-25 10:16 +08:00（Asia/Shanghai）
 
 # GameTestBridge：阶段 1 外部测试桥
 
@@ -327,3 +327,5 @@ sqlite3 -header -column 'game/test_bridge/artifacts/phase2_evidence.sqlite3' "SE
 若工具不在默认路径，使用 `-PythonPath`、`-GodotPath`、`-NewmanPath` 显式传入；脚本不会修改永久环境变量。Airtest 需要真实前台图形窗口，仍按上文单独运行，不在无头 runner 上伪装 UI 验收。阶段 2 的 CI 验收还要求远端同一提交连续 3 次成功并保存报告；工作流文件存在或本机单次通过都不算完成。咖啡服务调度问题已提交独立[上游 PR #166](https://github.com/mewamew/my_ai_town/pull/166)，缺陷闭环报告仍需补齐修复前后证据。Airtest 子项已经验收，阶段 2 整体仍不能划线。
 
 2026-09-24 本机整链结果：首次运行在 Pylint 命名检查失败并保留摘要；修正后第二次运行 Pylint `10.00/10`、pytest `27 passed`、Godot `685 checks`、Newman `5 requests / 14 assertions / 0 failures`，并成功导入 CI 摘要。GitHub Actions 首次运行在 checkout 阶段因仓库内历史存档 fixture 的 Windows 长路径失败；第二次在 Python 安装阶段发现 Windows runner 不提供本机的 `3.11.16`。工作流已改为 checkout 前启用 Git longpaths，并使用官方清单中 Windows x64 可安装的 `3.11.9`；后续远端运行结果仍须单独核对。
+
+2026-09-25 第三次远端运行已进入回归步骤，预检却在空证据目录中读取不存在的 `Measure-Object.Sum` 而失败。本机用现有空目录复现同一严格模式错误，修正后空目录为 `0` 字节、非空目录仍返回实际大小；整链 `local-actions-empty-evidence-fix` 再次完成 Pylint `10.00/10`、pytest `27 passed`、Godot `685 checks`、Newman `5 requests / 14 assertions / 0 failures` 和 CI 摘要导入。是否解决 runner 的首次空目录场景，以新提交的远端实跑为准。
