@@ -1,4 +1,4 @@
-# Updated: 2026-09-25 10:48:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-28 14:20:00 +08:00 (Asia/Shanghai)
 [CmdletBinding()]
 param(
     [ValidateSet('all', 'preflight', 'static', 'pytest', 'godot', 'newman', 'evidence')]
@@ -239,6 +239,7 @@ function Invoke-PytestStage {
 
 function Invoke-GodotStage {
     $logPath = Join-Path $ArtifactsRoot "$RunId-godot.log"
+    $script:stageReportPaths = @($logPath)
     Invoke-LoggedCommand -FilePath $godotPath -Arguments @(
         '--headless',
         '--path', $gameRoot,
@@ -249,7 +250,40 @@ function Invoke-GodotStage {
     if ($content -notmatch 'GAMETEST_BRIDGE_PASS checks=') {
         throw 'Godot test exited without the GAMETEST_BRIDGE_PASS marker'
     }
-    $script:stageReportPaths = @($logPath)
+    # Scope this setting to the deterministic Godot test calls and restore it.
+    $previousNoNetwork = [Environment]::GetEnvironmentVariable(
+        'AI_TOWN_PROVIDER_TEST_NO_NETWORK', 'Process'
+    )
+    try {
+        $env:AI_TOWN_PROVIDER_TEST_NO_NETWORK = '1'
+        foreach ($suite in @(
+            @{
+                name = 'occupation'
+                script = 'res://tests/town_occupation_test.gd'
+                marker = 'TOWN_OCCUPATION_PASS checks=\d+'
+            },
+            @{
+                name = 'gateway-continuity'
+                script = 'res://tests/town_world_agent_gateway_continuity_test.gd'
+                marker = 'TOWN_WORLD_AGENT_GATEWAY_CONTINUITY_PASS'
+            }
+        )) {
+            $suiteLogPath = Join-Path $ArtifactsRoot "$RunId-godot-$($suite.name).log"
+            $script:stageReportPaths += $suiteLogPath
+            Invoke-LoggedCommand -FilePath $godotPath -Arguments @(
+                '--headless', '--path', $gameRoot, '--script', $suite.script
+            ) -LogPath $suiteLogPath
+            $suiteOutput = Get-Content -LiteralPath $suiteLogPath -Raw
+            if ($suiteOutput -notmatch $suite.marker) {
+                throw "Godot suite exited without its pass marker: $($suite.name)"
+            }
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable(
+            'AI_TOWN_PROVIDER_TEST_NO_NETWORK', $previousNoNetwork, 'Process'
+        )
+    }
 }
 
 function Invoke-NewmanStage {

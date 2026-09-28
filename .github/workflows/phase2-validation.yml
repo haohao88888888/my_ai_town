@@ -1,4 +1,4 @@
-# Updated: 2026-09-25 10:48:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-09-28 14:20:00 +08:00 (Asia/Shanghai)
 name: phase2-validation
 
 on:
@@ -41,7 +41,7 @@ jobs:
           npm install --global newman@6.2.2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run isolated bridge regression and import evidence
+      - name: Run isolated Phase 2 regressions and import evidence
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'godot-4.7.2.zip'

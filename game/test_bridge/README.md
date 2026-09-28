@@ -1,4 +1,4 @@
-> 更新时间：2026-09-25 10:50 +08:00（Asia/Shanghai）
+> 更新时间：2026-09-28 14:20 +08:00（Asia/Shanghai）
 
 # GameTestBridge：阶段 1 外部测试桥
 
@@ -316,7 +316,7 @@ sqlite3 -header -column 'game/test_bridge/artifacts/phase2_evidence.sqlite3' "SE
 
 ## 阶段 2 CI：GitHub Actions 与本机复跑
 
-`.github/workflows/phase2-validation.yml` 仍使用 GitHub Actions 托管 Windows runner，分为两个职责明确的 job：`bridge-regression` 安装核心依赖、固定版本 Python `3.11.9`、Node/Newman 和 Godot，调用同一个 `run_phase2_ci.ps1` 执行预检、核心 Python 静态分析、pytest、Godot Headless 和 Newman；`locust-static` 另装核心加 Locust 依赖，检查 Locust 场景的语法和导入。两者目前都在每次工作流触发时执行，不使用 `paths` 跳过必需检查；Locust job 只是静态检查，不冒充 1/5 客户端并发实跑。本机 Conda 使用 Python `3.11.16`；两者同属 3.11 系列，报告记录实际补丁版本，不伪称二进制完全一致。核心阶段结果汇总为 `*-ci-summary.json` 并导入 JSONL/SQLite；JUnit、日志、摘要和独立的 Locust 静态日志作为 Actions artifact 保留 7 天。历史 Jenkins 摘要导入入口保留用于读取旧证据，不代表继续使用 Jenkins。
+`.github/workflows/phase2-validation.yml` 仍使用 GitHub Actions 托管 Windows runner，分为两个职责明确的 job：`bridge-regression` 安装核心依赖、固定版本 Python `3.11.9`、Node/Newman 和 Godot，调用同一个 `run_phase2_ci.ps1` 执行预检、核心 Python 静态分析、pytest、Godot Headless 和 Newman。Godot stage 依次运行 Bridge 合同套件、咖啡职业回归、网关连续性套件；后两项仅在各自测试子进程运行期间临时禁止真实 provider 网络访问。`locust-static` 另装核心加 Locust 依赖，检查 Locust 场景的语法和导入。两者目前都在每次工作流触发时执行，不使用 `paths` 跳过必需检查；Locust job 只是静态检查，不冒充 1/5 客户端并发实跑。本机 Conda 使用 Python `3.11.16`；两者同属 3.11 系列，报告记录实际补丁版本，不伪称二进制完全一致。核心阶段结果汇总为 `*-ci-summary.json` 并导入 JSONL/SQLite；JUnit、日志、摘要和独立的 Locust 静态日志作为 Actions artifact 保留 7 天。历史 Jenkins 摘要导入入口保留用于读取旧证据，不代表继续使用 Jenkins。
 
 本机在仓库根目录运行（证据目录必须已存在）：
 
