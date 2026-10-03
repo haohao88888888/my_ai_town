@@ -1,4 +1,4 @@
-> 更新时间：2026-10-02 12:25 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-03（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -56,3 +56,11 @@ Development validation before this independent tree was assembled: genuine pre-f
 Independent-tree validation on 2026-10-02: `pr-bridge-20261002-full3` completed all five core stages locally (preflight, static, pytest, Godot, Newman), 137.4 seconds excluding resource import. Pylint was 10/10, pytest was 33 passed with no skips, Godot was 685 checks and Newman was 5 requests / 14 assertions / 0 failures. JSONL, SQLite, JUnit, stage logs and summary were retained in the developer's isolated artifact directory; they are not committed or evidence of hosted CI. Source was based on upstream `43ef1d1` with the explicit uncommitted contribution; final-SHA CI still needs verification.
 
 The first independent assembly omitted the existing speed-revision hook and failed two tests; the same assertions passed after including that required integration. Runner debugging also retained the initial PowerShell stderr/encoding and preflight failures. The runner now preserves native stderr as UTF-8 and checks the actual exit code, retains its 10 GiB free-space threshold using filesystem telemetry, writes Python syntax checks without bytecode files, and imports failure summaries instead of aborting before evidence collection. A real shell/child-process regression verifies stderr with exit 0 and failure with exit 3; these synthetic command probes validate the harness, not game behavior. Resource import exited 0 with sandbox certificate/editor-settings warnings, which are not suppressed.
+
+## Upstream draft and first hosted result
+
+[Draft PR #167](https://github.com/mewamew/my_ai_town/pull/167) contains this independently scoped Bridge contribution. The first hosted fork run [36965086430](https://github.com/haohao88888888/my_ai_town/actions/runs/36965086430), SHA `b212d751ab28cfa359a0e6c70cb0258c7196e37c`, **failed**: Locust static passed, core pytest had 32 passed / 1 failed. Godot and Newman stages were skipped after that failure, not passed. The real-event reporter test launched a nested pytest without forwarding the explicit Godot executable path; its two child cases failed during setup before the intended assertion. The local fallback path had hidden this harness defect. The test now resolves the existing executable fixture and explicitly forwards `--godot-bin` to the child; no game code, Schema or assertions were changed for this correction. New local and hosted validation must be checked separately, without inheriting prior-SHA results.
+
+The failed artifact was preserved locally and its SHA-256 matched the Actions upload digest `f665d238a3299eb03c55a4e87fa269647a8764f366449cf8f12c9096d2298689`. Upstream workflows require maintainer approval (`action_required`); this is neither a test pass nor a test failure. The contributor will edit the PR description manually in Chinese. Complete restore/cleanup and disorder validation remain open regardless of PR status.
+
+After forwarding the executable path, local run `pr-bridge-20261003-full1` again passed all five stages: Pylint 10/10, pytest 33 passed / 0 skipped (77.02 seconds), Godot 685 checks and Newman 5 requests / 14 assertions / 0 failures. Original assertions and the deliberately failing child case were retained. This local result is not hosted validation; the final updated commit still requires independent remote runs.

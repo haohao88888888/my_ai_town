@@ -256,7 +256,9 @@ def _assert_transport_failure(events: list[dict], evidence_root: Path, junit_pat
     assert json.loads(properties["transportEventIds"]) == [attempts[0]["eventId"]]
 
 
-def test_real_failure_retains_snapshot_and_websocket_timeline(tmp_path: Path) -> None:
+def test_real_failure_retains_snapshot_and_websocket_timeline(
+    tmp_path: Path, godot_executable: Path,
+) -> None:
     """A deliberate child assertion failure must reference real isolated-game evidence.
 
     This is a reporter acceptance experiment, not a newly discovered product bug.
@@ -295,6 +297,7 @@ def test_other_case_is_not_the_failed_case(http_session, command_bridge_base_url
     completed = subprocess.run(
         [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
          "-c", str(suite_root.parent / "pytest.ini"), str(child_test),
+         "--godot-bin", str(godot_executable),
          "--evidence-root", str(evidence_root), "--junitxml", str(junit_path),
          "--basetemp", str(child_root / "fresh-pytest-temp")],
         cwd=suite_root.parents[2], capture_output=True, text=True, encoding="utf-8",
