@@ -12,6 +12,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,8 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
+        self.connection_id = f"test-connection-{uuid.uuid4().hex}"
+        self.endpoints: dict[str, Any] = {}
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -66,6 +69,9 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
         port = location.port or 80
         self._socket = socket.create_connection((location.hostname, port), timeout=3.0)
         try:
+            self.endpoints = {"local": self._socket.getsockname(),
+                              "peer": self._socket.getpeername()}
+            deadline = time.monotonic() + 3.0
             key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
             self._socket.sendall((
                 f"GET /events HTTP/1.1\r\nHost: {location.hostname}:{port}\r\n"
@@ -73,6 +79,10 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
                 f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
             ).encode("ascii"))
             while b"\r\n\r\n" not in self._buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("event upgrade exceeded 3s deadline")
+                self._socket.settimeout(remaining)
                 incoming = self._socket.recv(4096)
                 if not incoming:
                     raise ConnectionError("event upgrade closed before headers completed")
@@ -137,6 +147,7 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
                     "gameEvent": value, "receivedAt": _utc_now(),
                     "receiveIndex": self._receive_index,
                     "wirePayloadSha256": hashlib.sha256(raw).hexdigest(),
+                    "connectionId": self.connection_id,
                 })
         except queue.Full:
             self._overflow = True
@@ -146,6 +157,7 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
                     self._received.put_nowait({
                         "traceError": type(error).__name__, "message": str(error),
                         "receivedAt": _utc_now(),
+                        "connectionId": self.connection_id,
                     })
                 except queue.Full:
                     self._overflow = True
@@ -159,9 +171,28 @@ class BridgeEventStream:  # pylint: disable=too-many-instance-attributes
             except queue.Empty:
                 break
         if self._overflow:
-            result.append({"traceError": "BufferOverflow", "receivedAt": _utc_now()})
+            result.append({"traceError": "BufferOverflow", "receivedAt": _utc_now(),
+                           "connectionId": self.connection_id})
             self._overflow = False
         return result
+
+    def request_policy_disconnect(self) -> dict[str, Any]:
+        """Send a real masked text frame, rejected by the existing receive-only policy."""
+        if self._socket is None or self._stop.is_set():
+            raise ValueError("policy injection requires a live subscription")
+        payload = b"disconnect-policy-probe"
+        mask = secrets.token_bytes(4)
+        frame = bytes([0x81, 0x80 | len(payload)]) + mask + bytes(
+            value ^ mask[index % 4] for index, value in enumerate(payload))
+        self._socket.sendall(frame)
+        return {"opcode": "text", "masked": True, "payloadBytes": len(payload),
+                "payloadSha256": hashlib.sha256(payload).hexdigest()}
+
+    def resource_state(self) -> dict[str, Any]:
+        """Observe only this test reader and socket, not server-side memory ownership."""
+        return {"connectionId": self.connection_id, "endpoints": self.endpoints,
+                "readerAlive": self._thread is not None and self._thread.is_alive(),
+                "socketClosed": self._socket is None or self._socket.fileno() == -1}
 
     def close(self) -> None:
         """Stop this reader only, without deleting or modifying any artifact."""

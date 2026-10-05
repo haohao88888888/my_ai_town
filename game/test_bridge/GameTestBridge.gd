@@ -365,7 +365,7 @@ func _route(path: String) -> Dictionary:
 		if not _commands.has(command_id):
 			return _failure(404, "COMMAND_NOT_FOUND")
 		return _success(_commands[command_id].receipt.duplicate(true))
-	if path not in ["/health", "/world/state"] and not path.begins_with("/residents/"):
+	if path not in ["/health", "/world/state", "/events/cursor"] and not path.begins_with("/residents/"):
 		return _failure(404, "ROUTE_NOT_FOUND")
 	var context: Dictionary = _context_provider.call() if _context_provider.is_valid() else {}
 	var world: Object = context.get("world")
@@ -375,6 +375,12 @@ func _route(path: String) -> Dictionary:
 	if not ready:
 		return _failure(503, "WORLD_NOT_READY")
 	var metadata := _metadata(context, world)
+	if path == "/events/cursor":
+		# Global to this Bridge instance, including periods without subscribers.
+		# Emitted means generated/queued, NOT transmitted or acknowledged by a peer.
+		metadata["streamId"] = _nonce
+		metadata["lastEmittedEventSequence"] = _event_sequence
+		return _success(metadata)
 	var identities: Array = world.get_resident_identity_snapshot().get("residents", [])
 	if path == "/world/state":
 		var residents: Array[Dictionary] = []

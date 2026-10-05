@@ -1,4 +1,4 @@
-> 更新时间：2026-10-03（Asia/Shanghai）
+> 更新时间：2026-10-05 20:54 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -13,6 +13,7 @@ Start the game with user arguments `--gametest-bridge` and optionally `--gametes
 - `GET /health`, `GET /world/state`, `GET /residents/{id}` expose public, whitelisted state, not credentials or resident memory contents.
 - `POST /commands/set-speed`, `move-player`, `save`, `load` require command and idempotency IDs, expected session/generation/version and a timeout. Movement uses the existing physical input path, not teleportation. Save/load delegate to the existing session lifecycle and are asynchronous.
 - `GET /commands/{commandId}` returns a receipt; HTTP acceptance does not mean completion.
+- `GET /events/cursor` returns current world metadata, a Bridge-instance `streamId` and `lastEmittedEventSequence`. This counts events generated/queued by the Bridge, not successful socket delivery or client receipt. World restart keeps the sequence within the same Bridge instance; a replacement instance has a new stream and resets it. An unready world returns 503.
 - `/events` upgrades to a WebSocket semantic event stream. Queue overflow disconnects the client; there is no historical replay. Query state and receipts after reconnecting.
 
 `protocol.schema.json` defines request/response/event contracts. The bridge bounds request size, connections, queued events and per-frame polling work. Loopback binding is not authentication: enable it only in a trusted local session.
@@ -47,7 +48,25 @@ The same normalized record is appended to JSONL and SQLite. JUnit properties lin
 
 Events without command IDs only have a case observation-window association; temporal proximity is not a causal link. Duplicate frames are retained rather than deduplicated. Trace decode/disconnect/overflow errors and Schema violations fail the case. The collector handles the Bridge's current unmasked, unfragmented text frames, not every WebSocket extension/control format. Source hashes identify the exact dirty or clean code used by a run. Intentional failing child pytest cases verify reporter retention, not product defects.
 
-## Protocol regression rationale and limitations
+## 事件窗口与异常边界补充（2026-10-05）
+
+修改原因：仅靠命令回执无法判断没有 commandId 的首尾状态通知是否缺失；正常连接的回归也不能证明断线后的查询与显式重连仍然可用。
+
+本次补充：
+
+- 用实际 HTTP 前后水位检查同一流的 `(start,end]` 有界事件窗口；八组受控消费序列覆盖顺序、乱序、重复及首/中/尾/全部遗漏。回放引用实际采集事件的证据 ID，与 live 事件分开存储，不冒充真实网络丢包。
+- 验证客户端主动断开、协议策略触发的服务端关闭，以及显式重新握手。断线窗口只提交一次命令，使用原 commandId 查询结果，不重发写请求；重连不提供历史事件补发。
+- 通过真实 World stop/start 和 TCP/WebSocket 验证世代变化、旧世代命令拒绝且无副作用、新命令可用。额外检查同一 Bridge 重监听与新实例换流；不同流、序号倒退或窗口超过 4096 时完整性记为未知，不拼接成通过。
+- 使用仓库已有 beta6 夹具的隔离副本调用实际 Store 只读入口，覆盖 17 个正常/异常场景及文件隔离检查。没有执行 hydration、恢复事务、回滚或递归清理，完整异常存档恢复仍未验收。
+- 在创建证据库前拒绝已有 basetemp，以及证据目录位于 basetemp 内的配置，防止 pytest 清理证据。每次运行使用新路径，失败产物保留。
+
+测试证据 UUID/追加顺序与游戏 eventId/eventSequence 始终分开；请求、事件、回放和水位响应通过显式来源字段关联。跨端 Access Log、实际引擎子进程资源计数及 Godot 驱动原始帧字节不可得的部分明确记为盲区，不宣称无泄漏或完整双端 tracing。生产 Planner/Recovery、正式存档恢复和性能容量不在这些结果范围内。
+
+移植前工作树验证为 pytest 51/51、原 Godot 合同 685 checks、Pylint 10/10；定向三轮各 12/12。真实换代子实验的 18 个条件不是额外 18 个 pytest 用例。以上是本地旧工作树结果，不能替代本独立 PR 树或新提交的远端 CI；发布前需独立复验并保留原始报告。
+
+### 原协议修复记录
+
+独立 PR 树复验（2026-10-05）：`pr-cursor-20261005-2050` 的预检、静态检查、pytest、Godot 和 Newman 五阶段均通过。pytest `51 passed / 0 skipped`（CLI 144.41 秒；JUnit 144.247 秒），原 Godot `685 checks`，Newman `5 requests / 14 assertions / 0 failures`，Pylint `10/10`。根运行 `pytest-20261005T124935266968Z-240847ce` 的 566 条 JSONL/SQLite 记录及 9 份源码指纹逐项核对；真实换代子实验 18/18、38 条记录独立核对。系统证书读取错误及 Node 弃用警告原样保留，工具退出码均为 0。这是本地未提交文件树的结果，不是新 SHA 的远端通过证明；没有混入咖啡或游戏资源变更。
 
 Two real-wire regressions are included: successful command events must include `failure: null`, and an idle connection must not resend its already-sent last frame. The sender resets both stored and local output when draining a frame. Event defaults preserve both required result/failure keys without weakening Schema assertions.
 

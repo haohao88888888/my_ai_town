@@ -34,6 +34,43 @@ def test_protocol_schema_is_valid_draft_2020_12(protocol_schema: dict) -> None:
     Draft202012Validator.check_schema(protocol_schema)
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("lastEmittedEventSequence", -1), ("lastEmittedEventSequence", 1.5),
+    ("lastEmittedEventSequence", True), ("streamId", "wrong-stream"),
+    ("delivered", True),
+])
+def test_event_cursor_rejects_invalid_contract(protocol_schema: dict, field: str,
+                                              value: object) -> None:
+    """Synthetic schema-only negatives are not game observation evidence."""
+    cursor = {"sessionId": "test", "worldGeneration": "generation:1", "stateVersion": 1,
+              "capturedAt": "2026-10-05T07:00:00Z", "streamId": "a" * 24,
+              "lastEmittedEventSequence": 0}
+    validator = _definition_validator(protocol_schema, "eventCursor")
+    validator.validate(cursor)
+    cursor[field] = value
+    with pytest.raises(ValidationError):
+        validator.validate(cursor)
+
+
+@pytest.mark.parametrize(("stream", "end", "expected"), [
+    ("b" * 24, 2, None), ("a" * 24, 1, None),
+    ("a" * 24, 5000, None), ("a" * 24, 2, True),
+])
+def test_event_window_guard_contract(event_window_audit, stream: str, end: int,
+                                     expected: bool | None) -> None:
+    """Synthetic unit inputs test the audit guard, not actual game observations."""
+    before = {"streamId": "a" * 24, "worldGeneration": "generation:1",
+              "lastEmittedEventSequence": 2}
+    after = {**before, "streamId": stream, "lastEmittedEventSequence": end}
+    result = event_window_audit(before, after, [])
+    assert result["allFramesComplete"] is expected
+    if expected is None:
+        assert result["completenessBlindSpot"]
+    else:
+        assert result["missingEventSequences"] == []
+        assert result["completenessBlindSpot"] is None
+
+
 def test_set_speed_request_accepts_valid_contract(protocol_schema: dict) -> None:
     """A complete speed command at legal boundaries must validate."""
     request_body = {

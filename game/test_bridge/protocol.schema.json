@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GameTest Bridge response v0.1",
-  "description": "Updated 2026-09-15. Read snapshots, opt-in commands, formal session save/load, and WebSocket semantic events. Request and event contracts are under #/$defs.",
+  "description": "Updated 2026-10-05. Read snapshots, opt-in commands, formal session save/load, WebSocket semantic events and a read-only emitted-event cursor (not a delivery acknowledgement). Request and event contracts are under #/$defs.",
   "type": "object",
   "additionalProperties": false,
   "required": ["protocolVersion", "requestId", "ok", "data", "error"],
@@ -17,7 +17,7 @@
       "properties": {
         "ok": {"const": true},
         "error": {"type": "null"},
-        "data": {"oneOf": [{"$ref": "#/$defs/health"}, {"$ref": "#/$defs/world"}, {"$ref": "#/$defs/residentSnapshot"}, {"$ref": "#/$defs/commandReceipt"}, {"$ref": "#/$defs/moveReceipt"}, {"$ref": "#/$defs/sessionReceipt"}]}
+        "data": {"oneOf": [{"$ref": "#/$defs/health"}, {"$ref": "#/$defs/world"}, {"$ref": "#/$defs/residentSnapshot"}, {"$ref": "#/$defs/commandReceipt"}, {"$ref": "#/$defs/moveReceipt"}, {"$ref": "#/$defs/sessionReceipt"}, {"$ref": "#/$defs/eventCursor"}]}
       }
     },
     {
@@ -204,6 +204,15 @@
         "worldGeneration": {"type": "string", "minLength": 1},
         "stateVersion": {"type": "integer", "minimum": 0},
         "capturedAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "eventCursor": {
+      "allOf": [{"$ref": "#/$defs/metadata"}],
+      "type": "object", "unevaluatedProperties": false,
+      "required": ["streamId", "lastEmittedEventSequence"],
+      "properties": {
+        "streamId": {"type": "string", "pattern": "^[a-f0-9]{24}$"},
+        "lastEmittedEventSequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
       }
     },
     "coordinate": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},

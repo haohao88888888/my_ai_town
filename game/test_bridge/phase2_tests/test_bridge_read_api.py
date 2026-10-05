@@ -61,6 +61,29 @@ def test_health_and_world_match_protocol_schema(
     assert world["data"]["residentCount"] == 15
 
 
+def test_event_cursor_is_read_only_and_matches_world_metadata(
+    http_session: requests.Session, bridge_base_url: str,
+    response_validator: Draft202012Validator, record_bridge_response: ResponseRecorder,
+) -> None:
+    """Cursor reads neither generate events nor mutate a quiescent isolated world."""
+    before = _request_json(http_session, record_bridge_response, bridge_base_url,
+                           "/world/state", 200)["data"]
+    cursors = [_request_json(http_session, record_bridge_response, bridge_base_url,
+                             "/events/cursor", 200) for _ in range(3)]
+    after = _request_json(http_session, record_bridge_response, bridge_base_url,
+                          "/world/state", 200)["data"]
+    for cursor in cursors:
+        response_validator.validate(cursor)
+        assert set(cursor["data"]) == {"sessionId", "worldGeneration", "stateVersion",
+                                       "capturedAt", "streamId", "lastEmittedEventSequence"}
+        for key in ("sessionId", "worldGeneration", "stateVersion"):
+            assert cursor["data"][key] == before[key] == after[key]
+    assert len({cursor["data"]["streamId"] for cursor in cursors}) == 1
+    assert {cursor["data"]["lastEmittedEventSequence"] for cursor in cursors} == {0}
+    assert before["residentCount"] == after["residentCount"] == 15
+    assert before["simulationSpeed"] == after["simulationSpeed"]
+
+
 def test_world_resident_ids_are_unique_and_detail_is_public_only(
     http_session: requests.Session,
     bridge_base_url: str,

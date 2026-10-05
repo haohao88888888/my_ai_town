@@ -5,17 +5,237 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+# Pylint 2.14 on this Windows runtime misses os.environ; verified as os._Environ.
+from os import environ  # pylint: disable=no-name-in-module
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
 from game.test_bridge.evidence_store import EvidenceStore  # pylint: disable=import-error
+
+
+def test_real_world_generation_transition_rejects_old_command(  # pylint: disable=too-many-locals,too-many-statements
+    tmp_path: Path, godot_executable: Path, request: pytest.FixtureRequest, cursor_replay_evidence,
+) -> None:
+    """Real in-memory World restart and wire observations, NOT save/load or Agent recovery."""
+    game_root = Path(__file__).resolve().parents[2]
+    bridge_source = game_root / "test_bridge/GameTestBridge.gd"
+    world_source = game_root / "world/runtime/TownWorldRuntime.gd"
+    protected = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in (bridge_source, world_source)}
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    script = tmp_path / "world-generation-wire.gd"
+    driver = r'''extends "res://tests/game_test_bridge_test.gd"
+func _run_bridge_tests() -> void:
+	_port = $PORT
+	var data = _build_data()
+	var opening = _load_opening(data)
+	_world = WORLD.new()
+	_expect(_world.call("start", data, opening).get("ok", false), "world starts")
+	_bridge = BRIDGE.new()
+	root.add_child(_bridge)
+	var started = _bridge.start(_context, _port, true)
+	if not started.get("ok", false):
+		_bridge.free()
+		quit(1)
+		return
+	var initial_cursor = await _exchange(_header("/events/cursor"))
+	var peer = StreamPeerTCP.new()
+	peer.connect_to_host("127.0.0.1", _port)
+	var deadline = Time.get_ticks_msec() + 5000
+	while peer.get_status() == StreamPeerTCP.STATUS_CONNECTING and Time.get_ticks_msec() < deadline:
+		peer.poll()
+		await process_frame
+	var headers = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+	headers += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+	peer.put_data(_header("/events", "GET", headers).to_utf8_buffer())
+	var handshake = PackedByteArray()
+	while handshake.get_string_from_ascii().find("\r\n\r\n") < 0 and Time.get_ticks_msec() < deadline:
+		peer.poll()
+		if peer.get_available_bytes() > 0:
+			handshake.append_array(peer.get_data(peer.get_available_bytes())[1])
+		await process_frame
+	_expect(handshake.get_string_from_ascii().begins_with("HTTP/1.1 101 "), "real handshake")
+	var before = await _exchange(_header("/world/state"))
+	var old_command = _command("epoch-before", 2)
+	var old_receipt = await _exchange(_post(old_command))
+	var events = [await _read_websocket_event(peer), await _read_websocket_event(peer)]
+	var old_state = await _exchange(_header("/world/state"))
+	var old_cursor = await _exchange(_header("/events/cursor"))
+	_world.call("stop")
+	var stopped_cursor = await _exchange(_header("/events/cursor"))
+	_expect(_world.call("start", data, opening).get("ok", false), "same world restarts")
+	await process_frame
+	var new_state = await _exchange(_header("/world/state"))
+	var new_cursor = await _exchange(_header("/events/cursor"))
+	events.append(await _read_websocket_event(peer))
+	var stale = _command("epoch-stale", 3)
+	stale.expectedWorldGeneration = old_state.body.data.worldGeneration
+	var rejected = await _exchange(_post(stale))
+	var after_reject = await _exchange(_header("/world/state"))
+	var fresh = _command("epoch-fresh", 3)
+	var fresh_receipt = await _exchange(_post(fresh))
+	events.append(await _read_websocket_event(peer))
+	events.append(await _read_websocket_event(peer))
+	var final_state = await _exchange(_header("/world/state"))
+	var final_cursor = await _exchange(_header("/events/cursor"))
+	peer.disconnect_from_host()
+	_bridge.stop()
+	_expect(_bridge.start(_context, _port, true).get("ok", false), "relisten")
+	var relisten_cursor = await _exchange(_header("/events/cursor"))
+	_bridge.stop()
+	_bridge.free()
+	_bridge = BRIDGE.new()
+	root.add_child(_bridge)
+	_expect(_bridge.start(_context, _port, true).get("ok", false), "new bridge starts")
+	var replacement_cursor = await _exchange(_header("/events/cursor"))
+	print("WORLD_GENERATION_WIRE " + JSON.stringify({
+		"before": before, "oldState": old_state, "newState": new_state,
+		"oldCommand": old_command, "oldReceipt": old_receipt,
+		"staleCommand": stale, "rejected": rejected, "afterReject": after_reject,
+		"freshCommand": fresh, "freshReceipt": fresh_receipt,
+		"initialCursor": initial_cursor, "oldCursor": old_cursor, "stoppedCursor": stopped_cursor,
+		"newCursor": new_cursor, "finalCursor": final_cursor, "relistenCursor": relisten_cursor,
+		"replacementCursor": replacement_cursor, "finalState": final_state, "events": events}))
+	_bridge.stop()
+	_bridge.free()
+	_world.call("stop")
+	_finish_suite("WORLD_GENERATION_WIRE_PASS")'''
+    script.write_text(driver.replace("$PORT", str(port)), encoding="utf-8")
+    started_at = time.monotonic()
+    completed = subprocess.run(
+        [str(godot_executable), "--headless", "--path", str(game_root),
+         "--log-file", str(tmp_path / "godot-engine.log"), "--script", str(script),
+         "--", "--gametest-isolated-test"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=40, check=False, env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
+    )
+    output = completed.stdout + completed.stderr
+    (tmp_path / "godot-output.log").write_text(output, encoding="utf-8")
+    lines = [line.removeprefix("WORLD_GENERATION_WIRE ") for line in output.splitlines()
+             if line.startswith("WORLD_GENERATION_WIRE ")]
+    facts = json.loads(lines[0]) if len(lines) == 1 else {}
+    evidence = EvidenceStore(tmp_path / "evidence", "godot-generation-wire", metadata={
+        "parentCaseId": request.node.nodeid, "protectedSourceSha256": protected,
+        "driverSha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "scope": "actual World stop/start and TCP/WS; NOT save/load, Mock or Agent Recovery",
+    })
+    request.node.user_properties.extend([
+        ("childRunId", evidence.run_id), ("childEvidenceJsonl", str(evidence.jsonl_path)),
+    ])
+    experiment = evidence.record("generation_experiment", status="observed", details={
+        "actualExitCode": completed.returncode, "facts": facts,
+        "outputLog": str(tmp_path / "godot-output.log"),
+    })
+    schema = json.loads((game_root / "test_bridge/protocol.schema.json").read_text("utf-8"))
+    validator = Draft202012Validator({"$schema": schema["$schema"], "$ref": "#/$defs/event",
+                                      "$defs": schema["$defs"]}, format_checker=FormatChecker())
+    events = facts.get("events", [])
+    schema_errors = [error.message for event in events for error in validator.iter_errors(event)]
+    observed_events = []
+    for index, event in enumerate(events):
+        observed_events.append(evidence.record("game_event", name=event.get("eventType"),
+                        command_id=event.get("commandId"), session_id=event.get("sessionId"),
+                        world_generation=event.get("worldGeneration"),
+                        state_version=event.get("stateVersion"),
+                        event_sequence=event.get("eventSequence"), details={
+                            "gameEvent": event, "gameEventId": event.get("eventId"),
+                            "receiveIndex": index + 1, "observationSource": "godot-real-websocket",
+                            "wirePayloadSha256": None,
+                            "blindSpot": "existing Godot decoder does not retain raw frame bytes",
+                        }))
+    def state(key: str) -> dict:
+        return facts.get(key, {}).get("body", {}).get("data", {})
+    old, new, after = state("oldState"), state("newState"), state("afterReject")
+    identity = ("sessionId", "worldGeneration", "stateVersion", "simulationSpeed", "residentCount")
+    checks = {
+        "engine-exit-and-output": completed.returncode == 0 and len(lines) == 1
+                                  and "SCRIPT ERROR" not in output,
+        "world-generation-changes": bool(old.get("worldGeneration"))
+                                    and old.get("worldGeneration") != new.get("worldGeneration"),
+        "same-session": bool(old.get("sessionId")) and old.get("sessionId") == new.get("sessionId"),
+        "stale-command-rejected": facts.get("rejected", {}).get("status") == 409
+                                  and facts.get("rejected", {}).get("body", {}).get("error", {})
+                                  .get("code") == "WORLD_GENERATION_CONFLICT",
+        "rejection-no-state-mutation": bool(new) and all(new.get(key) == after.get(key)
+                                                        for key in identity),
+        "resident-count-preserved": all(state(key).get("residentCount") == 15
+                                         for key in ("before", "oldState", "newState",
+                                                     "afterReject", "finalState")),
+        "event-schema": len(events) == 5 and not schema_errors,
+        "old-and-new-event-generations": len(events) == 5
+            and all(event.get("worldGeneration") == old.get("worldGeneration")
+                    for event in events[:2])
+            and all(event.get("worldGeneration") == new.get("worldGeneration")
+                    for event in events[2:]),
+        "epoch-transition-linked": len(events) == 5
+            and events[2].get("eventType") == "state-version-changed"
+            and events[2].get("previousWorldGeneration") == old.get("worldGeneration"),
+        "new-command-and-event": len(events) == 5
+            and events[3].get("eventType") == "command-completed"
+            and events[3].get("commandId") == facts.get("freshCommand", {}).get("commandId")
+            and events[3].get("stateVersion") == state("freshReceipt").get("stateVersion")
+            and state("freshReceipt").get("status") == "completed"
+            and state("finalState").get("simulationSpeed") == 3,
+        "source-unmodified": all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+                                 for path, digest in protected.items()),
+    }
+    sequences = [event.get("eventSequence") for event in events]
+    checks["bridge-sequence-continues-across-world-epoch"] = (
+        len(events) == 5 and not schema_errors
+        and all(current > previous for previous, current in zip(sequences, sequences[1:]))
+        and len({event.get("eventId") for event in events}) == 5)
+    response_validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    cursor_keys = ("initialCursor", "oldCursor", "stoppedCursor", "newCursor",
+                   "finalCursor", "relistenCursor", "replacementCursor")
+    cursor_errors = [error.message for key in cursor_keys
+                     for error in response_validator.iter_errors(facts.get(key, {}).get("body"))]
+    checks["cursor-response-schema"] = not cursor_errors
+    checks["cursor-unready-rejected"] = facts.get("stoppedCursor", {}).get("status") == 503 and (
+        facts.get("stoppedCursor", {}).get("body", {}).get("error", {}).get("code")
+        == "WORLD_NOT_READY")
+    windows = []
+    if len(events) == 5 and not schema_errors and not cursor_errors:
+        cursors = {key: state(key) for key in cursor_keys}
+        cursors["experimentEvidenceId"] = experiment["eventId"]
+        windows, changed_stream = cursor_replay_evidence(evidence, events, observed_events, cursors)
+        checks["replacement-stream-not-merged"] = changed_stream["allFramesComplete"] is None
+    checks["commandless-boundary-detection"] = len(windows) == 4 and (
+        [window["allFramesComplete"] for window in windows] == [True, False, False, False]
+        and windows[1]["missingEventSequences"] == [events[2]["eventSequence"]]
+        and windows[2]["missingEventSequences"] == [events[4]["eventSequence"]]
+        and "commandId" not in events[2] and "commandId" not in events[4])
+    checks["cursor-zero-and-epoch-continuity"] = not cursor_errors and (
+        state("initialCursor").get("lastEmittedEventSequence") == 0
+        and state("oldCursor").get("lastEmittedEventSequence") == events[1]["eventSequence"]
+        and state("newCursor").get("lastEmittedEventSequence") == events[2]["eventSequence"]
+        and state("finalCursor").get("lastEmittedEventSequence") == events[-1]["eventSequence"]
+        and state("oldCursor").get("streamId") == state("finalCursor").get("streamId")
+        and state("oldCursor").get("worldGeneration") == old.get("worldGeneration")
+        and state("newCursor").get("worldGeneration") == new.get("worldGeneration"))
+    checks["bridge-object-lifetime-cursor"] = not cursor_errors and (
+        state("relistenCursor").get("streamId") == state("finalCursor").get("streamId")
+        and state("relistenCursor").get("lastEmittedEventSequence") == events[-1]["eventSequence"]
+        and state("replacementCursor").get("streamId") != state("finalCursor").get("streamId")
+        and state("replacementCursor").get("lastEmittedEventSequence") == 0)
+    for name, passed in checks.items():
+        evidence.record("test_case", name=name, status="passed" if passed else "failed",
+                        details={"factsEvidenceScope": "real driver output",
+                                 "schemaErrors": schema_errors})
+    evidence.finish(status="passed" if all(checks.values()) else "failed", total=len(checks),
+                    passed=sum(checks.values()), failed=sum(not value for value in checks.values()),
+                    skipped=0, other=0,
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 3))
+    assert all(checks.values()), {"checks": checks, "facts": facts, "output": output}
 
 
 def test_jsonl_and_sqlite_store_the_same_traceable_run(tmp_path: Path) -> None:
@@ -50,7 +270,6 @@ def test_jsonl_and_sqlite_store_the_same_traceable_run(tmp_path: Path) -> None:
         other=0,
         duration_ms=15.0,
     )
-
     jsonl_events = [
         json.loads(line)
         for line in store.jsonl_path.read_text(encoding="utf-8").splitlines()
@@ -63,7 +282,6 @@ def test_jsonl_and_sqlite_store_the_same_traceable_run(tmp_path: Path) -> None:
     assert jsonl_events[1] == case_event
     assert jsonl_events[1]["commandId"] is None
     assert jsonl_events[1]["eventSequence"] is None
-
     with sqlite3.connect(store.sqlite_path) as connection:
         run_row = connection.execute(
             """
@@ -81,7 +299,6 @@ def test_jsonl_and_sqlite_store_the_same_traceable_run(tmp_path: Path) -> None:
             """,
             (store.run_id,),
         ).fetchone()
-
     assert run_row == ("failed", 1, 0, 1, 0, 0, 15.0)
     assert event_row == (
         "test_case",
@@ -105,7 +322,6 @@ def test_finished_store_rejects_late_evidence(tmp_path: Path) -> None:
         other=0,
         duration_ms=1.0,
     )
-
     with pytest.raises(RuntimeError, match="run has finished"):
         store.record("test_case", name="too-late", status="passed")
 
@@ -482,6 +698,7 @@ def test_read_only_agent_save_validation_without_cleanup(  # pylint: disable=too
          "--script", str(script)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=30, check=False,
+        env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
     )
     (tmp_path / "godot-output.log").write_text(completed.stdout + completed.stderr,
                                                encoding="utf-8")
@@ -526,3 +743,258 @@ def test_read_only_agent_save_validation_without_cleanup(  # pylint: disable=too
     assert not failures, failures
     assert before == {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in source_paths}
+
+
+_SNAPSHOT_CASES = {
+    "valid-full-15": None,
+    "truncated-json": "存档文件损坏",
+    "non-object-json": "存档文件损坏",
+    "future-slot-version": "format_version 不受支持",
+    "future-snapshot-version": "format_version 不受支持",
+    "slot-identity": "slot_id 与上下文不一致",
+    "session-identity": "session_id 与上下文不一致",
+    "revision-identity": "save_revision 与上下文不一致",
+    "missing-payload": "居民载荷缺失",
+    "truncated-payload": "byte_length 不一致",
+    "tampered-payload": "SHA-256 不一致",
+    "duplicate-resident": "居民身份损坏或重复",
+    "resident-set-mismatch": "居民集合与独立集合记录不一致",
+    "independent-set-hash": "独立居民集合摘要不一致",
+    "manifest-count": "居民集合数量不一致",
+    "payload-path-escape": "居民文件引用无效",
+    "valid-after-rejections": None,
+}
+
+
+def _file_fingerprints(root: Path) -> dict:
+    """Include file names and bytes to detect mutations, additions and removals."""
+    return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+@pytest.mark.parametrize("layout", ["same-root", "evidence-inside-temp", "existing-temp"])
+def test_unsafe_basetemp_is_rejected_before_any_cleanup(tmp_path: Path, layout: str) -> None:
+    """Reject unsafe pytest temp layouts before EvidenceStore or tmp_path can mutate them."""
+    child_root = tmp_path / "safety-child"
+    child_root.mkdir()
+    suite_root = Path(__file__).resolve().parent
+    shutil.copyfile(suite_root / "conftest.py", child_root / "conftest.py")
+    child_test = child_root / "test_safety.py"
+    child_test.write_text('def test_must_not_run(tmp_path):\n    assert False\n', encoding="utf-8")
+    temp_root = child_root / "protected-temp"
+    if layout == "existing-temp":
+        temp_root.mkdir()
+        (temp_root / "retained-failure.txt").write_text("keep original evidence", encoding="utf-8")
+    before = _file_fingerprints(temp_root) if temp_root.exists() else None
+    evidence_root = (temp_root if layout == "same-root" else temp_root / "evidence"
+                     if layout == "evidence-inside-temp" else child_root / "evidence")
+    completed = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-c", str(suite_root.parent / "pytest.ini"), str(child_test),
+         "--evidence-root", str(evidence_root), "--basetemp", str(temp_root),
+         "--junitxml", str(child_root / "safety-junit.xml")],
+        cwd=suite_root.parents[2], capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=30, check=False,
+    )
+    output = completed.stdout + completed.stderr
+    (child_root / "child-output.log").write_text(output, encoding="utf-8")
+    assert completed.returncode == 4, output
+    expected = ("Refusing existing basetemp" if layout == "existing-temp" else
+                "Evidence root must not equal or lie inside basetemp")
+    assert expected in output
+    assert not evidence_root.exists(), "Rejected layout must not create an evidence store"
+    assert before == (_file_fingerprints(temp_root) if temp_root.exists() else None)
+
+
+def _construct_snapshot_case(  # pylint: disable=too-many-branches,too-many-locals
+    destination: Path, source_slot: Path, manifest: dict, case_id: str,
+) -> dict:
+    """Construct retained copies; a missing payload is omitted, never deleted."""
+    copied = json.loads(json.dumps(manifest))
+    slot = json.loads((source_slot / "slot.json").read_text("utf-8"))
+    source_revision = (source_slot / "sessions" / manifest["session_id"]
+                       / "revisions" / str(manifest["save_revision"]))
+    revision = (destination / manifest["slot_id"] / "sessions" / manifest["session_id"]
+                / "revisions" / str(manifest["save_revision"]))
+    revision.mkdir(parents=True)
+    resident_set = json.loads((source_revision / "resident_set.json").read_text("utf-8"))
+    for index, entry in enumerate(manifest["residents"]):
+        # Fixture paths must be plain file names, not traversal or symlinks.
+        assert Path(entry["file"]).name == entry["file"]
+        source_payload = source_revision / entry["file"]
+        assert not source_payload.is_symlink()
+        payload = source_payload.read_bytes()
+        assert len(payload) == entry["byte_length"]
+        assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
+        if index == 0:
+            if case_id == "missing-payload":
+                continue
+            if case_id == "truncated-payload":
+                payload = payload[:-1]
+            if case_id == "tampered-payload":
+                payload = bytes([payload[0] ^ 1]) + payload[1:]
+        (revision / entry["file"]).write_bytes(payload)
+    if case_id == "future-slot-version":
+        slot["format_version"] += 1
+    elif case_id == "future-snapshot-version":
+        copied["format_version"] += 1
+    elif case_id == "slot-identity":
+        slot["slot_id"] = "different-slot"
+    elif case_id == "session-identity":
+        copied["session_id"] = "different-session"
+    elif case_id == "revision-identity":
+        copied["save_revision"] += 1
+    elif case_id == "duplicate-resident":
+        copied["residents"][1]["resident_id"] = copied["residents"][0]["resident_id"]
+    elif case_id == "resident-set-mismatch":
+        copied["residents"][-1]["resident_id"] = "resident_zz_test"
+    elif case_id == "independent-set-hash":
+        resident_set["resident_set_sha256"] = "0" * 64
+    elif case_id == "manifest-count":
+        copied["resident_count"] -= 1
+    elif case_id == "payload-path-escape":
+        copied["residents"][0]["file"] = "../resident_0000.bin"
+    snapshot_text = json.dumps(copied, ensure_ascii=False)
+    if case_id == "truncated-json":
+        snapshot_text = snapshot_text[:32]
+    elif case_id == "non-object-json":
+        snapshot_text = "[]"
+    (revision / "snapshot.json").write_text(snapshot_text, encoding="utf-8")
+    (revision / "resident_set.json").write_text(
+        json.dumps(resident_set, ensure_ascii=False), encoding="utf-8")
+    (destination / manifest["slot_id"] / "slot.json").write_text(
+        json.dumps(slot, ensure_ascii=False), encoding="utf-8")
+    return {"id": case_id, "root": destination.as_posix(), "context": {
+        key: manifest[key] for key in ("slot_id", "session_id", "save_revision")}}
+
+
+def _write_snapshot_reader(script: Path, specs_path: Path) -> None:
+    """Bind only the storage path; run the unmodified real loader and hash returned bytes."""
+    script.write_text(
+        'extends SceneTree\n'
+        'const Store = preload("res://agent/lifecycle/AgentSaveStore.gd")\n'
+        'func _initialize() -> void:\n'
+        f'\tvar specs = JSON.parse_string(FileAccess.get_file_as_string('
+        f'{json.dumps(specs_path.as_posix())}))\n'
+        '\tvar cases = []\n'
+        '\tfor spec in specs:\n'
+        '\t\tvar store = Store.new()\n'
+        '\t\tstore.set("_store_root", spec["root"])\n'
+        '\t\tvar context = spec["context"]\n'
+        '\t\tcontext["save_revision"] = int(context["save_revision"])\n'
+        '\t\tvar started = Time.get_ticks_usec()\n'
+        '\t\tvar result = store.load_snapshot(context)\n'
+        '\t\tvar payloads = []\n'
+        '\t\tfor resident_id in result.get("resident_payloads", {}):\n'
+        '\t\t\tvar entry = result["resident_payloads"][resident_id]\n'
+        '\t\t\tvar hashing = HashingContext.new()\n'
+        '\t\t\thashing.start(HashingContext.HASH_SHA256)\n'
+        '\t\t\thashing.update(entry["payload"])\n'
+        '\t\t\tpayloads.append({"residentId": resident_id,\n'
+        '\t\t\t\t"residentName": entry["resident_name"],\n'
+        '\t\t\t\t"byteLength": entry["payload"].size(),\n'
+        '\t\t\t\t"sha256": hashing.finish().hex_encode()})\n'
+        '\t\tcases.append({"id": spec["id"], "ok": result.get("ok"),\n'
+        '\t\t\t"errors": result.get("errors", []),\n'
+        '\t\t\t"context": result.get("context"), "payloads": payloads,\n'
+        '\t\t\t"durationMs": (Time.get_ticks_usec() - started) / 1000.0})\n'
+        '\tprint("FULL_READ_ONLY_SAVE_RESULTS " + JSON.stringify(cases))\n'
+        '\tquit(0)\n', encoding="utf-8")
+
+
+def test_real_load_snapshot_read_only_with_retained_abnormal_copies(  # pylint: disable=too-many-locals,too-many-statements
+    tmp_path: Path, pytestconfig: pytest.Config, godot_executable: Path,
+) -> None:
+    """Full read-only Store entry; NOT hydration, rollback, cleanup or root-guard acceptance."""
+    game_root = Path(pytestconfig.rootpath).parent
+    source_slot = (game_root / "tests/fixtures/historical_saves/beta6/agent_saves"
+                   / "roundtrip-slot-beta6")
+    source_revision = source_slot / "sessions/roundtrip-session-beta6/revisions/1"
+    manifest = json.loads((source_revision / "snapshot.json").read_text("utf-8"))
+    assert len(manifest["residents"]) == 15
+    source_before = _file_fingerprints(source_slot)
+    loader_path = game_root / "agent/lifecycle/AgentSaveStore.gd"
+    loader_before = hashlib.sha256(loader_path.read_bytes()).hexdigest()
+    fixtures = tmp_path / "fixtures"
+    specs = [_construct_snapshot_case(fixtures / case_id, source_slot, manifest, case_id)
+             for case_id in _SNAPSHOT_CASES]
+    fixtures_before = _file_fingerprints(fixtures)
+    specs_path = tmp_path / "snapshot-cases.json"
+    specs_path.write_text(json.dumps(specs, ensure_ascii=False), encoding="utf-8")
+    script = tmp_path / "full-read-only-save-validation.gd"
+    _write_snapshot_reader(script, specs_path)
+    started = time.monotonic()
+    output_path = tmp_path / "godot-output.log"
+    try:
+        completed = subprocess.run(
+            [str(godot_executable), "--headless", "--path", str(game_root),
+             "--log-file", str(tmp_path / "godot-engine.log"), "--script", str(script)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=45, check=False,
+            env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
+        )
+    except subprocess.TimeoutExpired as error:
+        partial = b"".join(part.encode("utf-8") if isinstance(part, str) else part or b""
+                           for part in (error.stdout, error.stderr))
+        output_path.write_bytes(partial)
+        raise
+    output = completed.stdout + completed.stderr
+    output_path.write_text(output, encoding="utf-8")
+    assert completed.returncode == 0, output
+    assert "SCRIPT ERROR" not in output, output
+    result_lines = [line.removeprefix("FULL_READ_ONLY_SAVE_RESULTS ")
+                    for line in completed.stdout.splitlines()
+                    if line.startswith("FULL_READ_ONLY_SAVE_RESULTS ")]
+    assert len(result_lines) == 1, output
+    cases = json.loads(result_lines[0])
+    (tmp_path / "snapshot-results.json").write_text(
+        json.dumps(cases, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert [case["id"] for case in cases] == list(_SNAPSHOT_CASES)
+    expected_payloads = {entry["resident_id"]: {
+        "residentId": entry["resident_id"], "residentName": entry["resident_name"],
+        "byteLength": entry["byte_length"], "sha256": entry["sha256"],
+    } for entry in manifest["residents"]}
+    evidence = EvidenceStore(tmp_path / "evidence", "godot-full-read-only-save", metadata={
+        "scope": "real load_snapshot; NOT hydration/rollback/cleanup/root-guard acceptance",
+        "storageBinding": "private _store_root bound to retained absolute fixture copy",
+        "loaderSha256": loader_before, "sourceSha256": source_before,
+        "construction": "snapshot-cases.json and retained fixtures; no deletion",
+        "network": "approved AI_TOWN_PROVIDER_TEST_NO_NETWORK=1 on Godot child only",
+    })
+    failures = []
+    expected_context = specs[0]["context"]
+    for case in cases:
+        fragment = _SNAPSHOT_CASES[case["id"]]
+        actual_payloads = {item["residentId"]: item for item in case["payloads"]}
+        if fragment is None:
+            matches = (case["ok"] is True and not case["errors"]
+                       and case["context"] == expected_context
+                       and len(case["payloads"]) == 15 and actual_payloads == expected_payloads)
+        else:
+            matches = (case["ok"] is False and not case["payloads"]
+                       and case["context"] is None
+                       and any(fragment in error for error in case["errors"]))
+        evidence.record("save_validation", name=case["id"],
+                        status="passed" if matches else "failed",
+                        duration_ms=case["durationMs"], details={
+                            "expectedOk": fragment is None, "expectedErrorFragment": fragment,
+                            "actual": case, "fixtureRoot": (fixtures / case["id"]).as_posix(),
+                            "outputPath": output_path.as_posix(),
+                            "scope": "full-store-read-only; no game events or HTTP requests",
+                        })
+        if not matches:
+            failures.append(case)
+    unchanged = (source_before == _file_fingerprints(source_slot)
+                 and fixtures_before == _file_fingerprints(fixtures)
+                 and loader_before == hashlib.sha256(loader_path.read_bytes()).hexdigest())
+    evidence.record("isolation_check", name="source-loader-and-fixtures-unchanged",
+                    status="passed" if unchanged else "failed",
+                    details={"fixtureSha256Before": fixtures_before,
+                             "fixtureSha256After": _file_fingerprints(fixtures)})
+    failure_count = len(failures) + int(not unchanged)
+    evidence.finish(status="failed" if failure_count else "passed", total=len(cases) + 1,
+                    passed=len(cases) + 1 - failure_count, failed=failure_count,
+                    skipped=0, other=0,
+                    duration_ms=round((time.monotonic() - started) * 1000, 3))
+    assert not failures, failures
+    assert unchanged, "Read-only validation changed source, loader or retained fixtures"

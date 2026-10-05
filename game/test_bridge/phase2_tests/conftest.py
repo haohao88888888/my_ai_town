@@ -6,6 +6,7 @@ import collections
 import hashlib
 import json
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -30,7 +31,70 @@ _EVIDENCE_CONTEXT: dict[str, Any] = {
     "store": None,
     "started_at": 0.0,
     "cases": {},
+    "bridge_processes": {},
 }
+
+
+def _audit_event_window(before: dict, after: dict, events: list[dict]) -> dict:
+    """Audit a bounded emitted sequence window, never delivery or historical replay."""
+    start, end = before["lastEmittedEventSequence"], after["lastEmittedEventSequence"]
+    result = {"beforeCursor": before, "afterCursor": after, "allFramesComplete": None,
+              "scope": "bounded emitted-event observation window; NOT delivery guarantee"}
+    if before["streamId"] != after["streamId"] or end < start or end - start > 4096:
+        result["completenessBlindSpot"] = "different stream, regressed cursor or window over 4096"
+        return result
+    expected = list(range(int(start) + 1, int(end) + 1))
+    sequences = [event["eventSequence"] for event in events]
+    foreign = [event["eventId"] for event in events
+               if event["eventId"] != f'{before["streamId"]}-event-{int(event["eventSequence"])}']
+    missing = sorted(set(expected) - set(sequences))
+    ordered = all(current > previous for previous, current in zip(sequences, sequences[1:]))
+    result.update(expectedEventCount=len(expected), observedEventCount=len(events),
+                  missingEventSequences=missing, foreignEventIds=foreign,
+                  unexpectedEventSequences=sorted(set(sequences) - set(expected)),
+                  strictlyIncreasing=ordered, worldGenerationChanged=(
+                      before["worldGeneration"] != after["worldGeneration"]),
+                  allFramesComplete=(sequences == expected and not foreign),
+                  completenessBlindSpot=None)
+    return result
+
+
+@pytest.fixture(name="event_window_audit")
+def fixture_event_window_audit() -> Callable[[dict, dict, list[dict]], dict]:
+    """Expose the same window audit to Python and real Godot wire evidence tests."""
+    return _audit_event_window
+
+
+@pytest.fixture(name="cursor_replay_evidence")
+def fixture_cursor_replay_evidence() -> Callable:
+    """Record controlled consumption of actual Godot events with real HTTP cursors."""
+    def record(evidence, events, observations, cursors):
+        windows = []
+        for scenario, indexes in {"complete-generation-window": [2, 3, 4],
+                                  "omitted-first-commandless": [3, 4],
+                                  "omitted-last-commandless": [2, 3],
+                                  "omitted-all": []}.items():
+            replay_ids = []
+            for index in indexes:
+                source = observations[index]
+                replay = evidence.record("controlled_event_replay", name=events[index]["eventType"],
+                    event_sequence=events[index]["eventSequence"], details={
+                        **source["details"], "observationSource": "controlled-replay",
+                        "sourceEvidenceId": source["eventId"], "replayScenario": scenario})
+                replay_ids.append(replay["eventId"])
+            window = _audit_event_window(cursors["oldCursor"], cursors["finalCursor"],
+                                        [events[index] for index in indexes])
+            evidence.record("cursor_window_checkpoint", name=scenario, status="observed",
+                            details={"eventWindow": window, "replayEvidenceIds": replay_ids,
+                                     "sourceExperimentEvidenceId": cursors["experimentEvidenceId"],
+                                     "factsSource": "actual driver HTTP cursor responses"})
+            windows.append(window)
+        changed = _audit_event_window(cursors["finalCursor"], cursors["replacementCursor"], [])
+        evidence.record("cursor_window_checkpoint", name="actual-bridge-replacement",
+                        status="observed", details={**changed,
+                            "sourceExperimentEvidenceId": cursors["experimentEvidenceId"]})
+        return windows, changed
+    return record
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -65,11 +129,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Open one evidence run before test collection and execution."""
+    evidence_root = Path(str(session.config.getoption("evidence_root"))).resolve()
+    configured_temp = session.config.option.basetemp
+    if configured_temp is not None:
+        temp_root = Path(configured_temp).resolve()
+        if evidence_root == temp_root or temp_root in evidence_root.parents:
+            raise pytest.UsageError("Evidence root must not equal or lie inside basetemp")
+        if temp_root.exists():
+            raise pytest.UsageError("Refusing existing basetemp: recursive cleanup is forbidden")
     cases: dict[str, dict[str, Any]] = _EVIDENCE_CONTEXT["cases"]
     cases.clear()
     _EVIDENCE_CONTEXT["started_at"] = time.monotonic()
     _EVIDENCE_CONTEXT["store"] = EvidenceStore(
-        Path(str(session.config.getoption("evidence_root"))),
+        evidence_root,
         "pytest",
         metadata={
             "rootdir": str(session.config.rootpath),
@@ -127,6 +199,7 @@ def _case_result(nodeid: str) -> dict[str, Any]:
             "error_type": None, "message": None, "response_event_ids": [],
             "transport_event_ids": [], "evidence_event_ids": [],
             "request_event_ids": [], "game_event_ids": [], "failure_event_ids": [],
+            "replay_event_ids": [],
             "trace": None,
         },
     )
@@ -138,6 +211,7 @@ def _case_links(result: dict[str, Any]) -> dict[str, list[str]]:
         "responseEventIds": result["response_event_ids"],
         "transportEventIds": result["transport_event_ids"],
         "gameEventEvidenceIds": result["game_event_ids"],
+        "controlledReplayEvidenceIds": result["replay_event_ids"],
         "failureEventIds": result["failure_event_ids"],
         "evidenceEventIds": result["evidence_event_ids"],
     }
@@ -155,6 +229,9 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
         self.game_events: list[dict[str, Any]] = []
         self.gaps: list[str] = []
         self.protocol_errors: list[str] = []
+        self.schema_path = schema_path
+        self.expected_disconnect: dict[str, Any] | None = None
+        self.connection_history: list[str] = [self.stream.connection_id]
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.validator = Draft202012Validator({
             "$schema": schema["$schema"], "$ref": "#/$defs/event", "$defs": schema["$defs"],
@@ -180,6 +257,8 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
         step_index = len(self.requests) + 1
         details = {
             "stepId": f"{self.case_id}::http-{step_index}", "stepIndex": step_index,
+            "connectionId": self.stream.connection_id,
+            "subscriptionState": self.stream.resource_state(),
             "expectedSessionId": source.get("expectedSessionId"),
             "expectedWorldGeneration": source.get("expectedWorldGeneration"),
             "expectedStateVersion": source.get("expectedStateVersion"),
@@ -204,12 +283,133 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
         while True:
             for observation in self.stream.drain():
                 if "traceError" in observation:
+                    expected = self.expected_disconnect
+                    if (expected is not None and not expected["observed"]  # pylint: disable=too-many-boolean-expressions
+                            and observation.get("connectionId") == expected["connectionId"]
+                            and observation["traceError"] == "ConnectionError"
+                            and observation.get("message") == "event peer disconnected"
+                            and time.monotonic() <= expected["deadline"]):
+                        expected["observed"] = True
+                        self._record("expected_disconnect", status="observed", details={
+                            **observation, "injectionEvidenceId": expected["evidenceId"],
+                            "eofDeadlineSeconds": 2.0,
+                            "scope": "only injected connection EOF; no global error suppression",
+                        })
+                        continue
                     self.gap(f"{observation['traceError']}: {observation.get('message', '')}")
                     continue
                 self._game_event(observation)
             if time.monotonic() >= deadline:
                 return
             time.sleep(0.01)
+
+    def disconnect(self, mode: str) -> None:
+        """Inject one real disconnect and retain the narrowly bounded expected EOF."""
+        assert mode in {"client-close", "server-policy-close"}
+        self.flush(0.05)
+        assert not self.gaps and not self.protocol_errors
+        injection = self._record("disconnect_injection", name=mode, status="started", details={
+            "connectionId": self.stream.connection_id, "mode": mode,
+            "before": self.stream.resource_state(), "eofDeadlineSeconds": 2.0,
+        })
+        self.expected_disconnect = None
+        if mode == "server-policy-close":
+            self.expected_disconnect = {
+                "connectionId": self.stream.connection_id, "observed": False,
+                "evidenceId": injection["eventId"], "deadline": time.monotonic() + 2.0,
+            }
+            wire = self.stream.request_policy_disconnect()
+            self._record("disconnect_wire_injection", status="sent", details={
+                **wire, "connectionId": self.stream.connection_id,
+                "injectionEvidenceId": injection["eventId"],
+            })
+            while (time.monotonic() < self.expected_disconnect["deadline"]
+                   and not self.expected_disconnect["observed"] and not self.gaps):
+                self.flush(0.01)
+            assert self.expected_disconnect["observed"], "Injected server EOF absent within 2s"
+        self.stream.close()
+        self.flush()
+        state = self.stream.resource_state()
+        self._record("disconnect_checkpoint", status="observed", details={
+            **state, "injectionEvidenceId": injection["eventId"], "mode": mode,
+            "readerJoinDeadlineSeconds": 1.0,
+        })
+        assert state["socketClosed"] and not state["readerAlive"], state
+        assert not self.gaps and not self.protocol_errors
+
+    def reconnect(self) -> None:
+        """One fresh socket and handshake; failures are retained, never silently retried."""
+        previous = self.stream.resource_state()
+        assert previous["socketClosed"] and not previous["readerAlive"]
+        self.expected_disconnect = None
+        self.stream = BridgeEventStream(self.base_url)
+        self.connection_history.append(self.stream.connection_id)
+        attempt = self._record("reconnect_attempt", status="started", details={
+            "previousConnectionId": previous["connectionId"],
+            "connectionId": self.stream.connection_id, "attempt": 1, "maxAttempts": 1,
+            "connectTimeoutSeconds": 3.0, "handshakeDeadlineSeconds": 3.0,
+            "scope": "test-orchestrated reconnect; NOT production automatic recovery",
+        })
+        try:
+            self.stream.start()
+        except (OSError, ValueError) as error:
+            self.gap(f"reconnect failed without retry: {type(error).__name__}: {error}")
+            raise
+        self._record("reconnect_checkpoint", status="connected", details={
+            **self.stream.resource_state(), "attemptEvidenceId": attempt["eventId"],
+        })
+
+    def connection_checkpoint(self, name: str, facts: dict[str, Any]) -> dict[str, Any]:
+        """Persist real HTTP facts and connection links before making test assertions."""
+        return self._record("connection_checkpoint", name=name, status="observed", details={
+            **facts, **self.stream.resource_state(),
+            "requestEvidenceIds": [event["eventId"] for event in self.requests],
+            "responseEvidenceIds": [event["eventId"] for event in self.responses],
+            "gameEventEvidenceIds": [event["eventId"] for event in self.game_events],
+            "connectionHistory": list(self.connection_history),
+            "eventWaitSeconds": 3.0, "httpTimeoutSeconds": 5.0,
+            "receiptPollingWindowSeconds": 10.0,
+            "scope": "real disconnect and explicit test reconnect, no POST resend",
+        })
+
+    def resource_checkpoint(self, name: str) -> None:
+        """Read owned process metrics with existing PowerShell; unavailable data stays explicit."""
+        owned = _EVIDENCE_CONTEXT["bridge_processes"].get(self.base_url)
+        assert owned is not None, "Disconnect validation requires this run's isolated process"
+        metrics: dict[str, Any] = {}
+        blind_spots = ["server internal client/object counts", "per-connection Access Log",
+                      "server-to-client connection ID mapping", "long-term memory leak proof"]
+        console_wrapper = Path(owned["godotExecutable"]).name.endswith("_console.exe")
+        if console_wrapper:
+            blind_spots.append("actual Godot child-process resource counters; "
+                               "console launcher counters are NOT engine counters")
+        try:
+            result = subprocess.run([
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                f"$p=Get-Process -Id {int(owned['pid'])} -ErrorAction Stop; "
+                "$p | Select-Object Id,WorkingSet64,PrivateMemorySize64,HandleCount,CPU,"
+                "@{n='ThreadCount';e={$_.Threads.Count}} | ConvertTo-Json -Compress",
+            ], capture_output=True, text=True, timeout=8.0, check=False)
+            if result.returncode != 0:
+                raise ValueError(f"process probe exit {result.returncode}")
+            metrics = json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            blind_spots.append(f"process counters unavailable: {type(error).__name__}: {error}")
+        log = Path(owned["engineLogPath"])
+        log_data = log.read_bytes() if log.is_file() else None
+        self._record("resource_checkpoint", name=name, status="observed", details={
+            **owned, "processMetrics": metrics, "client": self.stream.resource_state(),
+            "processMetricsScope": ("console launcher only; NOT actual Godot engine"
+                                    if console_wrapper else "directly launched executable"),
+            "engineLogSha256AtRead": (hashlib.sha256(log_data).hexdigest()
+                                      if log_data is not None else None),
+            "engineLogTailAtRead": (log_data.decode("utf-8", errors="replace").splitlines()[-20:]
+                                    if log_data is not None else []),
+            "blindSpots": blind_spots,
+            "alignment": "client UTC/4-tuple/requestId plus server response and engine log; "
+                         "timestamps alone do not establish cross-end causal identity",
+            "scope": "bounded samples, not a memory-leak or capacity acceptance claim",
+        })
 
     def _game_event(self, observation: dict[str, Any]) -> None:
         source = observation["gameEvent"]
@@ -224,6 +424,8 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
             if isinstance(sequence, int) and isinstance(previous_sequence, int):
                 if sequence <= previous_sequence:
                     anomalies.append("non-increasing-game-event-sequence")
+                elif sequence > previous_sequence + 1:
+                    anomalies.append("game-event-sequence-gap")
         matching = [request for request in self.requests
                     if source.get("commandId") is not None
                     and request["commandId"] == source.get("commandId")
@@ -231,8 +433,10 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
         matching_ids = {request["eventId"] for request in matching}
         response_ids = [response["eventId"] for response in self.responses
                         if response["details"].get("requestEvidenceId") in matching_ids]
+        replay = observation.get("observationSource") == "controlled-replay"
         event = self._record(
-            "game_event", name=source.get("eventType"),
+            "controlled_event_replay" if replay else "game_event",
+            name=source.get("eventType"),
             status="failed" if errors else "observed",
             command_id=source.get("commandId"), session_id=source.get("sessionId"),
             world_generation=source.get("worldGeneration"),
@@ -242,8 +446,15 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
                 "receivedAt": observation["receivedAt"], "schemaErrors": errors,
                 "receiveIndex": observation["receiveIndex"],
                 "wirePayloadSha256": observation["wirePayloadSha256"],
+                "connectionId": observation.get("connectionId"),
+                "observationSource": "controlled-replay" if replay else "live-websocket",
+                "sourceEvidenceId": observation.get("sourceEvidenceId"),
+                "replayScenario": observation.get("replayScenario"),
+                "replayIndex": observation.get("replayIndex"),
                 "sequenceObservations": anomalies,
-                "stepId": f"{self.case_id}::ws-{len(self.game_events) + 1}",
+                "stepId": (f"{self.case_id}::replay-{observation['replayScenario']}-"
+                           f"{observation['replayIndex']}" if replay else
+                           f"{self.case_id}::ws-{len(self.game_events) + 1}"),
                 "relatedRequestEvidenceIds": [request["eventId"] for request in matching],
                 "relatedStepIds": [request["details"]["stepId"] for request in matching],
                 "relatedResponseEvidenceIds": response_ids,
@@ -254,9 +465,71 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
             },
         )
         self.game_events.append(event)
-        _case_result(self.case_id)["game_event_ids"].append(event["eventId"])
+        if not replay:
+            _case_result(self.case_id)["game_event_ids"].append(event["eventId"])
+        else:
+            _case_result(self.case_id)["replay_event_ids"].append(event["eventId"])
         if errors:
             self.protocol_errors.append(event["eventId"])
+
+    def replay_observations(self, scenario: str, sources: list[dict[str, Any]],
+                            order: list[int]) -> list[dict[str, Any]]:
+        """Replay captured bytes' decoded events in a separate, non-network trace.
+
+        No game event is fabricated or changed. Receive index/time/hash stay original;
+        scenario/index and source evidence links identify the controlled replay.
+        """
+        replay = CaseEventTrace(self.case_id, self.base_url, self.schema_path)
+        replay.requests = list(self.requests)
+        replay.responses = list(self.responses)
+        for replay_index, source_index in enumerate(order, start=1):
+            original = sources[source_index]
+            assert original["eventType"] == "game_event", "Only live observations may be replayed"
+            details = original["details"]
+            replay._game_event({  # pylint: disable=protected-access
+                "gameEvent": details["gameEvent"], "receivedAt": details["receivedAt"],
+                "receiveIndex": details["receiveIndex"],
+                "wirePayloadSha256": details["wirePayloadSha256"],
+                "observationSource": "controlled-replay", "sourceEvidenceId": original["eventId"],
+                "replayScenario": scenario, "replayIndex": replay_index,
+            })
+        return replay.game_events
+
+    def replay_checkpoint(self, scenario: str, observations: list[dict[str, Any]],
+                          facts: dict[str, Any]) -> dict[str, Any]:
+        """Link a controlled sequence to actual read-only facts, not a fake recovery outcome."""
+        post_ids = {request["eventId"] for request in self.requests
+                    if request["name"].startswith("POST ")}
+        expected_commands = {response["commandId"] for response in self.responses
+                             if response["details"].get("requestEvidenceId") in post_ids
+                             and response["details"].get("receiptStatus") in {"completed", "failed"}
+                             and response["commandId"] is not None}
+        observed_commands = {event["commandId"] for event in observations
+                             if event["name"] in {"command-completed", "command-failed"}}
+        window = (_audit_event_window(facts["beforeCursor"], facts["afterCursor"],
+                                     [event["details"]["gameEvent"] for event in observations])
+                  if "beforeCursor" in facts else {
+                      "allFramesComplete": None,
+                      "completenessBlindSpot": "no cursor; command-less notifications unknown",
+                  })
+        return self._record("replay_checkpoint", name=scenario, status="observed", details={
+            "observationSource": "controlled-replay",
+            "replayEvidenceIds": [event["eventId"] for event in observations],
+            "sequenceObservations": [event["details"]["sequenceObservations"]
+                                     for event in observations],
+            "beforeState": facts["beforeState"], "afterState": facts["afterState"],
+            "actualReceipt": facts["actualReceipt"],
+            "readResponseEvidenceIds": [event["eventId"] for event in self.responses[-2:]],
+            "expectedTerminalCommandIds": sorted(expected_commands),
+            "observedTerminalCommandIds": sorted(observed_commands),
+            "missingTerminalCommandIds": sorted(expected_commands - observed_commands),
+            "terminalBaselineSource": "actual terminal POST receipts, NOT hidden omitted events",
+            "eventWindow": window,
+            "cursorResponseEvidenceIds": facts.get("cursorResponseEvidenceIds", []),
+            "allFramesComplete": window["allFramesComplete"],
+            "completenessBlindSpot": window["completenessBlindSpot"],
+            "scope": "test-orchestrated read-only resync; NOT production automatic recovery",
+        })
 
     def wait_for_command(self, command_id: str, timeout_seconds: float = 3.0) -> dict[str, Any]:
         """Return the real terminal event or fail without inventing one or retrying a command."""
@@ -268,7 +541,26 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
                     "command-completed", "command-failed",
                 }:
                     return event
-        pytest.fail(f"No terminal WebSocket event for command {command_id}", pytrace=False)
+        self._record("event_wait_timeout", status="failed", command_id=command_id, details={
+            "timeoutSeconds": timeout_seconds, "connectionId": self.stream.connection_id,
+            "meaning": "event observation timeout; NOT command business failure",
+        })
+        try:
+            response = requests.get(f"{self.base_url}/commands/{command_id}", timeout=5.0)
+            body = response.json()
+            if not isinstance(body, dict):
+                raise ValueError("event-timeout receipt response is not a JSON object")
+            self._record("event_wait_receipt", status="observed", command_id=command_id,
+                         request_id=body.get("requestId"), details={
+                             "actualHttpStatus": response.status_code,
+                             "responseEnvelope": body, "httpTimeoutSeconds": 5.0,
+                             "meaning": "receipt evidence retained; event assertion still fails",
+                         })
+        except (requests.RequestException, ValueError) as error:
+            self._record("event_wait_receipt", status="unavailable", command_id=command_id,
+                         details={"captureError": type(error).__name__})
+        pytest.fail(f"No terminal WebSocket event within {timeout_seconds}s for command "
+                    f"{command_id}; query receipt to determine business status", pytrace=False)
 
     def capture_failure(self, report: pytest.TestReport) -> None:
         """Take a bounded post-assertion read and reference the complete observed timeline."""
@@ -306,8 +598,11 @@ class CaseEventTrace:  # pylint: disable=too-many-instance-attributes
                 "requestEvidenceIds": list(_case_result(self.case_id)["request_event_ids"]),
                 "responseEvidenceIds": list(_case_result(self.case_id)["response_event_ids"]),
                 "gameEventEvidenceIds": list(_case_result(self.case_id)["game_event_ids"]),
+                "controlledReplayEvidenceIds": list(_case_result(self.case_id)["replay_event_ids"]),
                 "traceGaps": list(self.gaps),
                 "protocolErrorEvidenceIds": list(self.protocol_errors),
+                "connectionHistory": list(self.connection_history),
+                "currentConnection": self.stream.resource_state(),
             },
         )
         _case_result(self.case_id)["failure_event_ids"].append(failure["eventId"])
@@ -481,6 +776,15 @@ def _isolated_bridge(
         return
 
     godot_bin = _resolve_godot_bin(pytestconfig)
+    location = urlsplit(base_url)
+    if location.scheme != "http" or location.hostname not in {"127.0.0.1", "localhost"}:
+        pytest.fail("Isolated Bridge requires an explicit loopback URL", pytrace=False)
+    try:
+        with socket.create_connection((location.hostname, location.port or 80), timeout=3.0):
+            pytest.fail("Refusing occupied Bridge port before starting or mutating a fixture",
+                        pytrace=False)
+    except ConnectionRefusedError:
+        pass
     # The reporter acceptance child copies conftest into an artifact directory;
     # the checked-in pytest.ini remains the source of the real project location.
     game_dir = Path(pytestconfig.rootpath).parent
@@ -519,11 +823,17 @@ def _isolated_bridge(
     lines: collections.deque[str] = collections.deque(maxlen=200)
     reader = threading.Thread(target=_capture_output, args=(process, lines), daemon=True)
     reader.start()
+    _EVIDENCE_CONTEXT["bridge_processes"][base_url] = {
+        "pid": process.pid, "engineLogPath": str(engine_log),
+        "godotExecutable": str(godot_bin),
+        "ownership": "this pytest run isolated Godot subprocess",
+    }
 
     try:
         _wait_until_ready(process, base_url, lines)
         yield base_url
     finally:
+        _EVIDENCE_CONTEXT["bridge_processes"].pop(base_url, None)
         if process.poll() is None:
             process.terminate()
             try:
