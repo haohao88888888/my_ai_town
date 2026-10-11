@@ -12,6 +12,7 @@ const PHOTO_WRITE_BLOCK_SCHEMA := "ai-town-conversation-photo-archive-block"
 const SAVE_STORE := preload(
 	"res://world/presentation/session/TownSessionSaveStore.gd"
 )
+const TEST_FILE_SYSTEM := preload("res://agent/AgentFileSystem.gd")
 
 # 照片只在图片转文字完成前短暂保存在内存中。正式会话目录和旧版归档
 # 仍由下面的兼容清理逻辑管理，但新流程绝不把照片字节写入磁盘。
@@ -60,6 +61,12 @@ func configure_test_roots(
 
 
 func configure_session(slot_id: String, session_id: String) -> Dictionary:
+	# Retention tests must enroll both participants before any lease can write.
+	if TEST_FILE_SYSTEM.test_retention_enabled() and (
+		not _storage_root_is_allowed()
+		or not TEST_FILE_SYSTEM.test_retention_path_allowed(String(_save_store.get("_root")))
+	):
+		return _failure("PHOTO_STORAGE_TEST_PATH_INVALID")
 	var safe_slot := _safe_segment(slot_id)
 	var safe_session := _safe_segment(session_id)
 	if safe_slot.is_empty() or safe_session.is_empty():
@@ -384,6 +391,8 @@ func _remove_archive_blocker(slot_id: String) -> bool:
 		return true
 	if not _archive_blocker_is_valid(slot_path, slot_id):
 		return false
+	if TEST_FILE_SYSTEM.test_retention_enabled():
+		return TEST_FILE_SYSTEM.retain_for_test(slot_path) == OK
 	return DirAccess.remove_absolute(
 		ProjectSettings.globalize_path(slot_path)
 	) == OK
@@ -427,12 +436,7 @@ func _restore_archive_blocker(
 		if _remove_tree(candidate_root) != OK:
 			return false
 	if DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(slot_path)):
-		if (
-			DirAccess.remove_absolute(
-				ProjectSettings.globalize_path(slot_path),
-			)
-			!= OK
-		):
+		if not _remove_empty_slot_root(slot_id):
 			return false
 	var file := FileAccess.open(slot_path, FileAccess.WRITE)
 	if file == null:
@@ -467,6 +471,8 @@ func _configured_session_context_is_exact() -> bool:
 
 
 func _storage_root_is_allowed() -> bool:
+	if TEST_FILE_SYSTEM.test_retention_enabled():
+		return TEST_FILE_SYSTEM.test_retention_path_allowed(_storage_root)
 	if _storage_root == STORAGE_ROOT:
 		return true
 	return (
@@ -483,12 +489,25 @@ func _storage_root_is_allowed() -> bool:
 func _remove_empty_slot_root(slot_id: String) -> bool:
 	var slot_path := "%s/%s" % [_storage_root, slot_id]
 	var absolute := ProjectSettings.globalize_path(slot_path)
+	if TEST_FILE_SYSTEM.test_retention_enabled() and not TEST_FILE_SYSTEM.test_retention_path_allowed(slot_path):
+		return false
 	if not DirAccess.dir_exists_absolute(absolute):
 		return not FileAccess.file_exists(slot_path)
+	if TEST_FILE_SYSTEM.test_retention_enabled():
+		# Preserve the original empty-only contract, not another session's tree.
+		var directory := DirAccess.open(absolute)
+		if directory == null:
+			return false
+		directory.include_hidden = true
+		var empty := directory.get_files().is_empty() and directory.get_directories().is_empty()
+		directory = null
+		return empty and TEST_FILE_SYSTEM.retain_for_test(slot_path) == OK
 	return DirAccess.remove_absolute(absolute) == OK
 
 
 func _remove_tree(path: String) -> Error:
+	if TEST_FILE_SYSTEM.test_retention_enabled():
+		return TEST_FILE_SYSTEM.retain_for_test(path)
 	var absolute := ProjectSettings.globalize_path(path)
 	if not DirAccess.dir_exists_absolute(absolute):
 		return OK
@@ -512,6 +531,8 @@ func _remove_tree(path: String) -> Error:
 
 
 func _make_directory(path: String) -> bool:
+	if TEST_FILE_SYSTEM.test_retention_enabled() and not TEST_FILE_SYSTEM.test_retention_path_allowed(path):
+		return false
 	var error := DirAccess.make_dir_recursive_absolute(
 		ProjectSettings.globalize_path(path)
 	)

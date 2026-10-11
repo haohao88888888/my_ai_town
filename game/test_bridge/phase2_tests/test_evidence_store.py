@@ -476,7 +476,6 @@ def test_real_failure_retains_snapshot_and_websocket_timeline(
     tmp_path: Path, godot_executable: Path,
 ) -> None:
     """A deliberate child assertion failure must reference real isolated-game evidence.
-
     This is a reporter acceptance experiment, not a newly discovered product bug.
     No fake HTTP responses, injected game events or real save files are used.
     """
@@ -628,7 +627,6 @@ def test_read_only_agent_save_validation_without_cleanup(  # pylint: disable=too
     tmp_path: Path, pytestconfig: pytest.Config, godot_executable: Path,
 ) -> None:
     """Exercise real read helpers, not restore transactions or mocked save outcomes.
-
     Direct helper calls deliberately do not test root configuration, full snapshot
     loading, lifecycle rollback or world retention. All generated files are retained.
     """
@@ -695,7 +693,7 @@ def test_read_only_agent_save_validation_without_cleanup(  # pylint: disable=too
     completed = subprocess.run(
         [str(godot_executable), "--headless", "--path", str(game_root),
          "--log-file", str(tmp_path / "godot-engine.log"),
-         "--script", str(script)],
+         "--script", str(script), "--", "--gametest-isolated-test"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=30, check=False,
         env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
@@ -704,6 +702,7 @@ def test_read_only_agent_save_validation_without_cleanup(  # pylint: disable=too
                                                encoding="utf-8")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "SCRIPT ERROR" not in completed.stdout + completed.stderr
+    assert "AI_TOWN_RENDERER" not in completed.stdout + completed.stderr
     results = [line.removeprefix("READ_ONLY_SAVE_RESULTS ")
                for line in completed.stdout.splitlines()
                if line.startswith("READ_ONLY_SAVE_RESULTS ")]
@@ -770,7 +769,6 @@ def _file_fingerprints(root: Path) -> dict:
     """Include file names and bytes to detect mutations, additions and removals."""
     return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(root.rglob("*")) if path.is_file()}
-
 
 @pytest.mark.parametrize("layout", ["same-root", "evidence-inside-temp", "existing-temp"])
 def test_unsafe_basetemp_is_rejected_before_any_cleanup(tmp_path: Path, layout: str) -> None:
@@ -928,7 +926,8 @@ def test_real_load_snapshot_read_only_with_retained_abnormal_copies(  # pylint: 
     try:
         completed = subprocess.run(
             [str(godot_executable), "--headless", "--path", str(game_root),
-             "--log-file", str(tmp_path / "godot-engine.log"), "--script", str(script)],
+             "--log-file", str(tmp_path / "godot-engine.log"), "--script", str(script),
+             "--", "--gametest-isolated-test"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=45, check=False,
             env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
@@ -942,6 +941,7 @@ def test_real_load_snapshot_read_only_with_retained_abnormal_copies(  # pylint: 
     output_path.write_text(output, encoding="utf-8")
     assert completed.returncode == 0, output
     assert "SCRIPT ERROR" not in output, output
+    assert "AI_TOWN_RENDERER" not in output, output
     result_lines = [line.removeprefix("FULL_READ_ONLY_SAVE_RESULTS ")
                     for line in completed.stdout.splitlines()
                     if line.startswith("FULL_READ_ONLY_SAVE_RESULTS ")]

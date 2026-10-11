@@ -750,7 +750,8 @@ def test_real_cleanup_retention_and_restore(  # pylint: disable=too-many-locals,
         completed = subprocess.run(
             [str(godot_executable), "--headless", "--path", str(game_root),
              "--log-file", str(tmp_path / "engine.log"), "--script", str(driver),
-             "--", str(spec)], capture_output=True, text=True, encoding="utf-8",
+             "--", str(spec), "--gametest-isolated-test"],
+            capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=90, check=False,
             env={**environ, "AI_TOWN_PROVIDER_TEST_NO_NETWORK": "1"},
         )
@@ -796,7 +797,8 @@ def test_real_cleanup_retention_and_restore(  # pylint: disable=too-many-locals,
                     == b"junction-target-evidence")
     evidence.record("isolation_check", name="original-foreign-agent-copy-unchanged",
                     status="passed" if isolated else "failed")
-    process_ok = completed.returncode == 0 and "SCRIPT ERROR" not in output and bool(results)
+    process_ok = (completed.returncode == 0 and "SCRIPT ERROR" not in output
+                  and "AI_TOWN_RENDERER" not in output and bool(results))
     evidence.record("process_check", name="real-godot-exit-and-script-errors",
                     status="passed" if process_ok else "failed",
                     details={"returnCode": completed.returncode,

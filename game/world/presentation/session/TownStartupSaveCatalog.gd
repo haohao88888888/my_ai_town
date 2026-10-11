@@ -11,6 +11,7 @@ const RECOVERY_PLANNER := preload(
 const RECONCILIATION_SERVICE := preload(
 	"res://world/presentation/session/TownSaveReconciliationService.gd"
 )
+const TEST_FILE_SYSTEM := preload("res://agent/AgentFileSystem.gd")
 const COMPATIBILITY := preload(
 	"res://world/presentation/session/TownSaveCompatibilityRegistry.gd"
 )
@@ -376,6 +377,12 @@ func clear_slot_profile(
 
 
 func _write_profile(profile: Dictionary) -> Dictionary:
+	# Test enrollment never permits falling back to the formal profile or cleanup.
+	if (
+		TEST_FILE_SYSTEM.test_retention_enabled()
+		and not TEST_FILE_SYSTEM.test_retention_path_allowed(_profile_path)
+	):
+		return _failure("STARTUP_SAVE_PROFILE_TEST_PATH_INVALID", false)
 	var parent_error := DirAccess.make_dir_recursive_absolute(
 		ProjectSettings.globalize_path(_profile_path.get_base_dir()),
 	)
@@ -392,8 +399,7 @@ func _write_profile(profile: Dictionary) -> Dictionary:
 	var write_error := file.get_error()
 	file = null
 	if write_error != OK:
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(temporary))
-		return _failure("STARTUP_SAVE_PROFILE_WRITE_FAILED", true)
+		return _profile_write_failure(_cleanup_profile_file(temporary))
 	var absolute_profile := ProjectSettings.globalize_path(_profile_path)
 	var absolute_temporary := ProjectSettings.globalize_path(temporary)
 	var absolute_backup := ProjectSettings.globalize_path(backup)
@@ -404,21 +410,42 @@ func _write_profile(profile: Dictionary) -> Dictionary:
 			absolute_backup,
 		)
 		if backup_error != OK:
-			DirAccess.remove_absolute(absolute_temporary)
-			return _failure("STARTUP_SAVE_PROFILE_WRITE_FAILED", true)
+			return _profile_write_failure(_cleanup_profile_file(absolute_temporary))
 		previous_moved = true
 	var rename_error := DirAccess.rename_absolute(
 		absolute_temporary,
 		absolute_profile,
 	)
 	if rename_error != OK:
-		DirAccess.remove_absolute(absolute_temporary)
+		var cleanup_error := _cleanup_profile_file(absolute_temporary)
+		var rollback_error := OK
 		if previous_moved:
-			DirAccess.rename_absolute(absolute_backup, absolute_profile)
-		return _failure("STARTUP_SAVE_PROFILE_WRITE_FAILED", true)
+			rollback_error = DirAccess.rename_absolute(absolute_backup, absolute_profile)
+		return _profile_write_failure(cleanup_error, rollback_error)
 	if previous_moved:
-		DirAccess.remove_absolute(absolute_backup)
+		var cleanup_error := _cleanup_profile_file(absolute_backup)
+		if TEST_FILE_SYSTEM.test_retention_enabled() and cleanup_error != OK:
+			return _failure("STARTUP_SAVE_PROFILE_RETENTION_FAILED", false, {
+				"cleanupError": int(cleanup_error), "profilePublished": true,
+			})
 	return _success()
+
+
+func _cleanup_profile_file(path: String) -> Error:
+	if TEST_FILE_SYSTEM.test_retention_enabled():
+		return TEST_FILE_SYSTEM.retain_for_test(path)
+	return DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+
+
+func _profile_write_failure(cleanup_error: Error, rollback_error: Error = OK) -> Dictionary:
+	if TEST_FILE_SYSTEM.test_retention_enabled() and (
+		cleanup_error != OK or rollback_error != OK
+	):
+		return _failure("STARTUP_SAVE_PROFILE_RETENTION_FAILED", false, {
+			"cleanupError": int(cleanup_error), "rollbackError": int(rollback_error),
+			"profilePublished": false,
+		})
+	return _failure("STARTUP_SAVE_PROFILE_WRITE_FAILED", true)
 
 
 func _inspect_slot(definition: Dictionary, profile_version: int) -> Dictionary:

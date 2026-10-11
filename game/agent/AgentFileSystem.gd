@@ -6,6 +6,7 @@ extends RefCounted
 static var _retention_root := ""
 static var _retention_sequence := 0
 static var _retention_incomplete: Dictionary = {}
+static var _retention_mutex := Mutex.new()
 
 
 static func configure_test_retention(root: String) -> Error:
@@ -111,6 +112,15 @@ static func _append_retention(record: Dictionary) -> Error:
 
 
 static func retain_for_test(path: String) -> Error:
+	# Worker saves can reach cleanup too. Serialize the complete move/journal
+	# transaction, not just the counter, so evidence cannot interleave or overwrite.
+	_retention_mutex.lock()
+	var result := _retain_for_test_locked(path)
+	_retention_mutex.unlock()
+	return result
+
+
+static func _retain_for_test_locked(path: String) -> Error:
 	if not test_retention_enabled():
 		return ERR_UNCONFIGURED
 	var absolute := ProjectSettings.globalize_path(path)
