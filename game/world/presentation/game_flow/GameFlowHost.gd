@@ -29,6 +29,8 @@ const SESSION_SAVE_STORE := preload(
 const AGENT_SAVE_STORE := preload(
 	"res://agent/lifecycle/AgentSaveStore.gd"
 )
+const GAMETEST_FILE_SYSTEM := preload("res://agent/AgentFileSystem.gd")
+const GAMETEST_AGENT_SYSTEM := preload("res://agent/AgentSystem.gd")
 const SESSION_SAVE_MANIFEST := preload(
 	"res://world/presentation/session/TownSessionSaveManifest.gd"
 )
@@ -309,6 +311,133 @@ var _daily_auto_save_pending_day := -1
 var _daily_auto_save_last_request_msec := 0.0
 var _daily_auto_save_last_total_msec := 0.0
 var _gametest_load_operation: Dictionary = {}
+var _gametest_storage_root := ""
+var _gametest_gateway_sequence := 0
+
+
+func gametest_configure_storage(owned_root: Variant) -> Dictionary:
+	# Test-only composition, never a production path override or health bypass.
+	if not OS.get_cmdline_user_args().has("--gametest-isolated-test"):
+		return _failure("GAMETEST_STORAGE_ISOLATION_REQUIRED", false)
+	if (
+		not _gametest_storage_root.is_empty() or _gateway != null
+		or _session_ui_service != null or _startup_save_catalog != null
+		or _startup_save_store != null or _startup_agent_save_store != null
+		or _formal_archive_service_override != null or _town_runtime != null
+		or _pending_runtime != null
+	):
+		return _failure("GAMETEST_STORAGE_ALREADY_CONFIGURED", false)
+	if not owned_root is String:
+		return _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+	var candidate := owned_root as String
+	if (
+		candidate != candidate.simplify_path() or not candidate.is_absolute_path()
+		or candidate.contains("://") or candidate.contains("\\")
+		or not GAMETEST_FILE_SYSTEM.test_retention_path_allowed(candidate)
+		or not DirAccess.dir_exists_absolute(candidate)
+	):
+		return _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+	for suffix: String in [
+		"world-saves", "agent-saves", "memory", "photos", "photo-leases",
+		"backups", "startup-profile.json", "provider-settings.json",
+		"provider-credentials.enc",
+	]:
+		if not GAMETEST_FILE_SYSTEM.test_retention_path_allowed(candidate.path_join(suffix)):
+			return _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+	# Config/credential backup recovery is not part of this storage-only seam.
+	# Refuse such evidence instead of allowing their legacy cleanup to remove it.
+	for name: String in ["provider-settings.json", "provider-credentials.enc"]:
+		for suffix: String in [".tmp", ".bak"]:
+			var path := candidate.path_join(name + suffix)
+			if FileAccess.file_exists(path) or DirAccess.dir_exists_absolute(path):
+				return _failure("GAMETEST_PROVIDER_RECOVERY_EVIDENCE_PRESENT", false)
+	var store := SESSION_SAVE_STORE.new()
+	store.set("_root", candidate.path_join("world-saves"))
+	var agent_store := AGENT_SAVE_STORE.new()
+	agent_store.set("_store_root", candidate.path_join("agent-saves"))
+	var catalog := STARTUP_SAVE_CATALOG.new()
+	var configured := catalog.configure(store, STARTUP_SAVE_CATALOG.DEFAULT_PROFILE_PATH, agent_store)
+	if configured.get("ok") != true:
+		return configured
+	# Absolute roots intentionally remain private test bindings; existing public
+	# configure_test_root/user:// contracts are neither broadened nor bypassed.
+	catalog.set("_profile_path", candidate.path_join("startup-profile.json"))
+	var archiver := FORMAL_SLOT_ARCHIVER.new()
+	archiver.set("_world_slots_root", candidate.path_join("world-saves/slots"))
+	archiver.set("_agent_slots_root", candidate.path_join("agent-saves"))
+	archiver.set("_photo_slots_root", candidate.path_join("photos"))
+	archiver.set("_backup_root", candidate.path_join("backups"))
+	(archiver.get("_save_store") as RefCounted).set("_root", candidate.path_join("world-saves"))
+	_gametest_storage_root = candidate
+	_startup_save_store = store
+	_startup_agent_save_store = agent_store
+	_startup_save_catalog = catalog
+	_formal_archive_service_override = archiver
+	return {"ok": true, "errorCode": "", "retryable": false, "changed": false}
+
+
+func _gametest_storage_valid() -> bool:
+	if (
+		not OS.get_cmdline_user_args().has("--gametest-isolated-test")
+		or not GAMETEST_FILE_SYSTEM.test_retention_path_allowed(_gametest_storage_root)
+	):
+		return false
+	for suffix: String in [
+		"world-saves", "agent-saves", "memory", "photos", "photo-leases",
+		"backups", "startup-profile.json", "provider-settings.json",
+		"provider-credentials.enc",
+	]:
+		if not GAMETEST_FILE_SYSTEM.test_retention_path_allowed(_gametest_storage_root.path_join(suffix)):
+			return false
+	return true
+
+
+func _create_session_gateway() -> Node:
+	if _gametest_storage_root.is_empty():
+		return GATEWAY.new()
+	if not _gametest_storage_valid():
+		return null
+	var agent_store := AGENT_SAVE_STORE.new()
+	agent_store.set("_store_root", _gametest_storage_root.path_join("agent-saves"))
+	var system := GAMETEST_AGENT_SYSTEM.new(agent_store)
+	_gametest_gateway_sequence += 1
+	var memory_root := _gametest_storage_root.path_join("memory/host-%d" % _gametest_gateway_sequence)
+	if not GAMETEST_FILE_SYSTEM.test_retention_path_allowed(memory_root):
+		return null
+	system.set("_runtime_memory_root_base", memory_root)
+	system.set("_memory_root", memory_root.path_join("initial"))
+	var gateway := GATEWAY.new()
+	gateway.set("_agent_system", system)
+	var photos: RefCounted = gateway.get("_photo_store")
+	photos.set("_storage_root", _gametest_storage_root.path_join("photos"))
+	(photos.get("_save_store") as RefCounted).set("_root", _gametest_storage_root.path_join("photo-leases"))
+	return gateway
+
+
+func _gametest_bind_session_store(service: RefCounted) -> Dictionary:
+	if not _gametest_storage_root.is_empty():
+		if not _gametest_storage_valid():
+			return _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+		var store: RefCounted = service.get("_store")
+		if store == null:
+			return _failure("GAMETEST_STORAGE_SERVICE_NOT_CONFIGURED", false)
+		store.set("_root", _gametest_storage_root.path_join("world-saves"))
+	return {"ok": true, "errorCode": "", "retryable": false}
+
+
+func _create_provider_settings_service() -> PROVIDER_SETTINGS_SERVICE:
+	var service := PROVIDER_SETTINGS_SERVICE.new()
+	if not _gametest_storage_root.is_empty():
+		if not _gametest_storage_valid():
+			return null
+		for name: String in ["provider-settings.json", "provider-credentials.enc"]:
+			for suffix: String in [".tmp", ".bak"]:
+				var path := _gametest_storage_root.path_join(name + suffix)
+				if FileAccess.file_exists(path) or DirAccess.dir_exists_absolute(path):
+					return null
+		(service.get("_store") as RefCounted).set("_path", _gametest_storage_root.path_join("provider-settings.json"))
+		(service.get("_credential_store") as RefCounted).set("_path", _gametest_storage_root.path_join("provider-credentials.enc"))
+	return service
 
 
 func _ready() -> void:
@@ -2165,18 +2294,22 @@ func _initialize_startup_settings_services() -> void:
 	# Provider binding publishes a synchronous ViewModel callback. Configure the
 	# local save catalog first so that callback can never publish a false
 	# no-save snapshot before Continue discovery is available.
-	_startup_save_store = SESSION_SAVE_STORE.new()
-	_startup_save_catalog = STARTUP_SAVE_CATALOG.new()
-	var startup_agent_save_store: RefCounted = AGENT_SAVE_STORE.new()
-	_startup_agent_save_store = startup_agent_save_store
-	var save_catalog_configuration := _startup_save_catalog.call(
-		"configure",
-		_startup_save_store,
-		STARTUP_SAVE_CATALOG.DEFAULT_PROFILE_PATH,
-		startup_agent_save_store,
-	) as Dictionary
-	if not bool(save_catalog_configuration.get("ok", false)):
-		_last_result = save_catalog_configuration
+	if _gametest_storage_root.is_empty():
+		_startup_save_store = SESSION_SAVE_STORE.new()
+		_startup_save_catalog = STARTUP_SAVE_CATALOG.new()
+		var startup_agent_save_store: RefCounted = AGENT_SAVE_STORE.new()
+		_startup_agent_save_store = startup_agent_save_store
+		var save_catalog_configuration := _startup_save_catalog.call(
+			"configure",
+			_startup_save_store,
+			STARTUP_SAVE_CATALOG.DEFAULT_PROFILE_PATH,
+			startup_agent_save_store,
+		) as Dictionary
+		if not bool(save_catalog_configuration.get("ok", false)):
+			_last_result = save_catalog_configuration
+	elif not _gametest_storage_valid():
+		_last_result = _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+		return
 	_startup_provider_service = PROVIDER_SERVICE.new()
 	_startup_provider_service.call("configure", {
 		"capabilityMode": "formal",
@@ -2184,7 +2317,10 @@ func _initialize_startup_settings_services() -> void:
 		"allowFake": false,
 		"providerConfigs": {},
 	}, self)
-	_startup_provider_settings_service = PROVIDER_SETTINGS_SERVICE.new()
+	_startup_provider_settings_service = _create_provider_settings_service()
+	if _startup_provider_settings_service == null:
+		_last_result = _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+		return
 	_connect_once(
 		_startup_provider_settings_service,
 		"view_model_changed",
@@ -4585,6 +4721,8 @@ func _bind_town_runtime(runtime: Node) -> void:
 		_agent_save_participant(),
 		_active_session_config,
 	) as Dictionary
+	if not _gametest_storage_root.is_empty() and save_configuration.get("ok") == true:
+		save_configuration = _gametest_bind_session_store(_session_ui_service)
 	var save_binding := adapter.call(
 		"bind_session_save_service",
 		_session_ui_service,
@@ -4609,7 +4747,10 @@ func _bind_town_runtime(runtime: Node) -> void:
 		"bind_audio_display_settings_service",
 		_audio_display_settings_service,
 	)
-	_provider_settings_ui_service = PROVIDER_SETTINGS_SERVICE.new()
+	_provider_settings_ui_service = _create_provider_settings_service()
+	if _provider_settings_ui_service == null:
+		_last_result = _failure("GAMETEST_STORAGE_PATH_INVALID", false)
+		return
 	_provider_settings_ui_service.bind_provider_service(_provider_service,
 		self)
 	adapter.call(
@@ -5200,7 +5341,10 @@ func _start_internal_new_game(draft: Dictionary) -> void:
 	if not bool(provider_configuration.get("ok", false)):
 		_set_resident_selection_result(provider_configuration)
 		return
-	_gateway = GATEWAY.new()
+	_gateway = _create_session_gateway()
+	if _gateway == null:
+		_set_resident_selection_result(_failure("GAMETEST_STORAGE_PATH_INVALID", false))
+		return
 	_pending_runtime = _instantiate_town_runtime()
 	if _pending_runtime == null:
 		_set_resident_selection_result(
@@ -5287,7 +5431,10 @@ func _start_formal_new_game(draft: Dictionary) -> void:
 	_advance_town_entry_loading(0.32, "正在准备小镇地图…")
 	_bootstrap = BOOTSTRAP.new()
 	_provider_service = _startup_provider_service
-	_gateway = GATEWAY.new()
+	_gateway = _create_session_gateway()
+	if _gateway == null:
+		_publish_resident_model_assignment_startup_failure(_failure("GAMETEST_STORAGE_PATH_INVALID", false))
+		return
 	_pending_runtime = _instantiate_town_runtime()
 	if _pending_runtime == null:
 		_publish_resident_model_assignment_startup_failure(
@@ -5813,7 +5960,10 @@ func _on_formal_continue_provider_health_completed(
 	if slot_id.is_empty():
 		_publish_startup_result(_failure("SESSION_SAVE_CONTEXT_INVALID", false))
 		return
-	_gateway = GATEWAY.new()
+	_gateway = _create_session_gateway()
+	if _gateway == null:
+		_publish_startup_result(_failure("GAMETEST_STORAGE_PATH_INVALID", false))
+		return
 	var restore_revision := int(manifest.get("save_revision", 0))
 	var session_id := String(manifest.get("session_id", ""))
 	var gateway_config := {
@@ -5907,6 +6057,8 @@ func _on_formal_continue_provider_health_completed(
 		_agent_save_participant(),
 		restored_session_config,
 	) as Dictionary
+	if not _gametest_storage_root.is_empty() and service_result.get("ok") == true:
+		service_result = _gametest_bind_session_store(restore_service)
 	if not bool(service_result.get("ok", false)):
 		_discard_pending_runtime()
 		_publish_startup_result(service_result)
