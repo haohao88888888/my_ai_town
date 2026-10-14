@@ -1,6 +1,18 @@
-> 更新时间：2026-10-12 20:49 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-14 20:08 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
+
+## Genuine Host HTTP/scene flow and restored revision receipts (2026-10-14)
+
+This follow-up supersedes the historical missing-route notes below. The isolated native test uses actual TCP HTTP and WebSocket clients, production Gateway/UI/Host composition, asynchronous save, automatic departure save, SourceRuntime → StartupScreen → TownRuntime, and formal Continue health/restore. It checks 15 residents, nonempty task/full log/memory consistency, save/load idempotency, old-generation rejection, and actual event sequences 1/2/3. A declared loopback model-protocol fixture receives two real Godot health requests; it is not real LLM quality evidence. Only the generated isolated scene copy disables the Runtime clock for deterministic content comparisons; business scripts and formal health checks are not replaced. This is not GUI black-box or performance acceptance.
+
+P025 was reproduced before repair: HTTP save publishes revision 2, original departure save publishes 3, and Continue actually restores 3, but both HTTP and WS completion report 2. Clean red run `closeout-host-flow-20261013-a2` failed only the native receipt-version assertion (54.51 seconds); original requests, events, snapshots and retained files remain. The red Host source matches Git `7cc1797`. Historical Python source bytes were not separately archived; its recorded fingerprint is not claimed to be a complete historical source snapshot. Generated native drivers and raw evidence are retained. The expressly authorized six-line fix synchronizes the completed load receipt from the committed active-session configuration; it does not change selection, departure saves, health checks or scene flow. Missing/nonpositive committed versions fail rather than fabricate a version.
+
+Green targeted runs a3/a4 passed; fresh full `closeout-flow-full-20261013-a1` passed five stages: pytest 70/70, zero failures/errors/skips (CLI 579.29 seconds), Godot 685 checks, Newman 5 requests/14 assertions and Pylint 10/10. Five-stage duration is 671702.8525999999 ms. Execution identity remains HEAD `7cc1797440270d8418927c27f94bc485d239f41e`, dirty=true, tracked diff SHA-256 `1c9a18dc3bf4dafdc6bc7d413228b44e41eb7e3176c501ab99982cbaa1214a3f`; do not relabel it as a later clean commit or hosted CI. Godot certificate-store and Node deprecation warnings remain recorded.
+
+Independent read-only audit rechecked 585 root JSONL/SQLite records, JUnit and nine root source hashes. The full Host child has 76 native conditions, 165 records, 39 HTTP exchanges, three actual WS events, two actual health requests, 563 source hashes and 267 retained-file hashes. Agent/manifest/HTTP/WS all report revision 3; the assertion trace link resolves to actual request/event evidence IDs and snapshot paths. Three other production children passed 53/36/74 conditions; five safety children and ten existing restore children were re-audited, including byte-identical failure snapshots. These are different counting units, not additional pytest cases. The local index is `artifacts/closeout-flow-full-20261013-a1/closeout-audit.json`.
+
+Profile flush-error and failed backup rollback branches remain unverified, default physical deletion remains prohibited/unexecuted, and unpublished Agent files are retained rather than physically rolled back. This closes the local complete Host route subitem only. Formal JMeter calibration/approved thresholds/measurement, final-source three hosted CI runs and requirement-by-requirement Phase 2 acceptance remain open. No PR was created, commented on or redescribed by this follow-up.
 
 ## Production services and opt-in Host storage (2026-10-12)
 

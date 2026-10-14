@@ -589,6 +589,12 @@ func gametest_poll_load(operation_id: String) -> Dictionary:
 		):
 			var world: Object = _town_runtime.get_world_runtime()
 			if is_instance_valid(world) and bool(world.is_running()):
+				# Departure saves before Continue rediscovers the latest pair.
+				# Report the committed restore, not the revision selected at acceptance.
+				var restored_revision := int(_active_session_config.get("saveRevision", 0))
+				if restored_revision <= 0:
+					return _failure("SESSION_LOAD_CONTEXT_INVALID", false)
+				_gametest_load_operation["saveRevision"] = restored_revision
 				_gametest_load_operation["status"] = "completed"
 	return {
 		"ok": true,

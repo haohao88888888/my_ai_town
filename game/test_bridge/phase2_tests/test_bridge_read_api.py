@@ -22,6 +22,9 @@ from game.test_bridge.evidence_store import EvidenceStore  # pylint: disable=imp
 from game.test_bridge.phase2_tests.test_evidence_import import (  # pylint: disable=import-error
     _audit_retention_journal,
 )
+from game.test_bridge.phase2_tests.test_bridge_command_api import (  # pylint: disable=import-error
+    prepare_native_case_files, prepare_host_flow_driver, record_host_flow_trace,
+)
 
 
 pytestmark = pytest.mark.live_bridge
@@ -294,10 +297,10 @@ func _initialize() -> void:
 func same(a: Variant, b: Variant) -> bool:
 	return JSON_HELPER.content_sha256(a) == JSON_HELPER.content_sha256(b)
 func path(name: String) -> String:
-	var base := String(spec["sandbox"]).path_join("owned/host" if spec["mode"] == "production-host-storage" else "owned")
+	var base := String(spec["sandbox"]).path_join("owned/host" if String(spec["mode"]).begins_with("production-host") else "owned")
 	return base if name.is_empty() else base.path_join(name)
 func gateway(name: String) -> Node:
-	if spec["mode"] == "production-host-storage":
+	if String(spec["mode"]).begins_with("production-host"):
 		return root.get_node("GameFlowHost").call("_create_session_gateway")
 	var store := AGENT_STORE.new()
 	store.set("_store_root", path("agent-saves"))
@@ -317,7 +320,7 @@ func service(runtime: Node, value: Node, config: Dictionary) -> RefCounted:
 	var configured: Dictionary = result.configure(runtime, runtime.call("get_world_runtime"), value.call("get_agent_save_participant"), config)
 	check("real-ui-service-" + runtime.name, configured.get("ok") == true, configured)
 	# configure has no storage side effects; bind its actual store before any operation.
-	if spec["mode"] == "production-host-storage":
+	if String(spec["mode"]).begins_with("production-host"):
 		var bound: Dictionary = root.get_node("GameFlowHost").call("_gametest_bind_session_store", result)
 		check("real-host-ui-store-binding", bound.get("ok") == true and result.get("_store").get("_root") == path("world-saves"), bound)
 	else:
@@ -382,7 +385,7 @@ func snapshot(name: String, state: Dictionary) -> void:
 	file = null
 func run() -> void:
 	spec = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
-	if spec["mode"] == "production-host-storage":
+	if String(spec["mode"]).begins_with("production-host"):
 		var rejected: Dictionary = root.get_node("GameFlowHost").call("gametest_configure_storage", path("before-enrollment"))
 		check("host-reject-before-enrollment", rejected.get("errorCode") == "GAMETEST_STORAGE_PATH_INVALID", rejected)
 	var enrolled := FS.configure_test_retention(spec["sandbox"])
@@ -402,7 +405,7 @@ func run() -> void:
 func production() -> void:
 	var host := Node.new()
 	root.add_child(host)
-	if spec["mode"] == "production-host-storage":
+	if String(spec["mode"]).begins_with("production-host"):
 		var flow := root.get_node("GameFlowHost")
 		for candidate: Variant in [null, true, "", spec["sandbox"], spec["foreign"], "user://town_session_saves", path("../escape"), path("invalid/")]:
 			var rejected: Dictionary = flow.call("gametest_configure_storage", candidate)
@@ -477,7 +480,7 @@ func production() -> void:
 	var bootstrap := BOOTSTRAP.new()
 	var outcomes: Array = []
 	var started: Dictionary = bootstrap.begin_new_game_from_catalog(draft, data, catalog, provider, source, runtime,
-		{"worldStartMode": "formal", "sessionId": "phase2-production", "slotId": "phase2-slot",
+		{"worldStartMode": "formal", "sessionId": "phase2-production", "slotId": "town-3" if spec["mode"] == "production-host-flow" else "phase2-slot",
 		"requestHost": host, "useLiveModel": true, "enablePlayerAvatar": false}, func(value): outcomes.append(value))
 	check("actual-bootstrap-accepted", started.get("accepted") == true, started)
 	deadline = Time.get_ticks_msec() + 15000
@@ -560,6 +563,10 @@ func production() -> void:
 	check("published-async-revision", context["save_revision"] == 1)
 	check("agent-adopts-published-context", same(source.call("get_agent_save_context"), context))
 	check("async-state-released", not ui.call("has_active_create_save_async"))
+	if spec["mode"] == "production-host-flow":
+		await bridge_host_roundtrip(runtime, source, ui, config, provider, resident, expected)
+		host.free()
+		return
 	var changed: Dictionary = source.call("apply_resident_memory_intervention", resident,
 		{"memoryKey": "phase2-memory", "operation": "edit", "playerText": "mutated-memory",
 		"expectedRevision": int(memory(source, resident).get("formal_memory_revision", -1))})
@@ -604,6 +611,8 @@ func production() -> void:
 	check("real-restored-session-close", restored.call("close_session").get("ok") == true)
 	target.free()
 	host.free()
+func bridge_host_roundtrip(_runtime: Node, _source: Node, _ui: RefCounted, _config: Dictionary, _provider: RefCounted, _resident: String, _expected: Dictionary) -> void:
+	check("host-flow-driver-not-implemented", false)
 '''
 
 
@@ -774,28 +783,9 @@ func threads() -> void:
 '''
 
 
-def _prepare_native_case_files(owned: Path, mode: str) -> None:
-    """Build only owned, explicit blockers and worker inputs; never delete them."""
-    if mode.startswith("profile"):
-        (owned / "profile-normal.json").write_bytes(b"original-profile")
-        (owned / "profile-locked.json").write_bytes(b"locked-profile")
-        (owned / "profile-blocked.json").mkdir()
-        (owned / "profile-blocked.json/proof.bin").write_bytes(b"publication-blocker")
-    if mode == "production-failure":
-        blocker = owned / "world-saves/slots/phase2-slot/manifests/00000000000000000001.json"
-        blocker.mkdir(parents=True)
-        (blocker / "proof.bin").write_bytes(b"native-manifest-publication-blocker")
-    if mode == "threads":
-        for index in range(4):
-            for offset in range(8):
-                directory = owned / f"thread-{index}-{offset}"
-                directory.mkdir()
-                (directory / "proof.bin").write_bytes(f"thread-{index}-{offset}".encode())
-
-
 @pytest.mark.parametrize("mode", (
     "roots", "photo", "threads", "profile", "profile-failure", "production", "production-failure",
-    "production-host-storage",
+    "production-host-storage", "production-host-flow",
 ))
 def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many-locals,too-many-statements
     tmp_path: Path, pytestconfig: pytest.Config, godot_executable: Path,
@@ -826,7 +816,7 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
                          "world/presentation/town_runtime/TownRuntime.gd",
                          "world/presentation/town_runtime/TownRuntime.tscn",
                          "world/runtime/TownWorldRuntime.gd", "world/data/town/town_world.json")
-        if mode == "production-host-storage":
+        if mode.startswith("production-host"):
             source_names += ("world/presentation/game_flow/GameFlowHost.gd",
                              "world/integration/TownFormalSlotArchiveService.gd",
                              "world/presentation/ui/TownProviderSettingsService.gd",
@@ -834,6 +824,13 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
                              "world/presentation/ui/TownProviderCredentialStore.gd",
                              "world/presentation/ui/TownProviderStoreFiles.gd",
                              "world/presentation/game_flow/GameFlowFormalOverwriteCompensator.gd")
+        if mode == "production-host-flow":
+            source_names = tuple(sorted(set(source_names) | {
+                p.relative_to(game).as_posix() for directory in ("agent", "common", "world", "ui")
+                for p in game.joinpath(directory).rglob("*")
+                if p.suffix in (".gd", ".tscn", ".gdshader") and p.is_file()} | {
+                    "test_bridge/GameTestBridge.gd", "test_bridge/protocol.schema.json",
+                    "test_bridge/phase2_tests/test_bridge_command_api.py"}))
     fingerprints = {n: hashlib.sha256((game / n).read_bytes()).hexdigest() for n in source_names}
     sandbox = tmp_path / f"gametest-retention-{mode}"
     owned = sandbox / "owned"
@@ -853,7 +850,7 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
     marker.write_text(json.dumps({"schema": "ai-town-conversation-photo-archive-block",
                                   "schema_version": 1, "slot_id": "slot"}), encoding="utf-8")
     original_marker = hashlib.sha256(marker.read_bytes()).hexdigest()
-    _prepare_native_case_files(owned, mode)
+    prepare_native_case_files(owned, mode)
     original_files = {p.relative_to(owned).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                       for p in owned.rglob("*") if p.is_file()}
     foreign = tmp_path / "foreign"
@@ -866,6 +863,8 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
     driver = tmp_path / "driver.gd"
     driver.write_text(_PRODUCTION_DRIVER if mode.startswith("production") else _ROOT_PHOTO_DRIVER,
                       encoding="utf-8")
+    extra_args = (prepare_host_flow_driver(tmp_path, _PRODUCTION_DRIVER)
+                  if mode == "production-host-flow" else [])
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [
         ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
@@ -883,7 +882,7 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
         result = subprocess.run([str(godot_executable), "--headless", "--path", str(game),
                                  "--log-file", str(tmp_path / "engine.log"),
                                  "--script", str(driver),
-                                 "--", str(spec), "--gametest-isolated-test"],
+                                 "--", str(spec), "--gametest-isolated-test", *extra_args],
                                 capture_output=True, text=True,
                                 encoding="utf-8", errors="replace",
                                 timeout=180 if mode.startswith("production") else 60, check=False,
@@ -912,7 +911,9 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
                   "production-failure": "actual worker manifest collision and live-state protection"
                                         "; protocol fixture, no real LLM",
                   "production-host-storage": "actual Host storage guards/composition and Gateway/UI"
-                                             " roundtrip; not full HTTP scene transition"}[mode],
+                                             " roundtrip; not full HTTP scene transition",
+                  "production-host-flow": "real TCP HTTP/WS, departure save, Startup/Town scene"
+                                          " transition, real formal health/restore"}[mode],
     })
     request.node.user_properties.extend([
         ("rootPhotoRunId", evidence.run_id),
@@ -923,9 +924,12 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
          if mode.startswith("production") else ""),
         ("nativeSnapshotRoot", sandbox.as_posix() if mode.startswith("production") else ""),
     ])
-    for check in checks:
-        evidence.record("root_photo_assertion", name=check["id"],
-                        status="passed" if check["passed"] else "failed", details=check)
+    assertion_events = [evidence.record(
+        "root_photo_assertion", name=check["id"],
+        status="passed" if check["passed"] else "failed", details=check) for check in checks]
+    trace_errors = (record_host_flow_trace(evidence, sandbox / "host-http.json",
+                                         request.node.nodeid, assertion_events)
+                    if mode == "production-host-flow" else [])
     if mode in ("roots", "profile-failure"):
         records = []
         mismatches = [] if journal.read_bytes() == b"" else [{"reason": "Unexpected journal write"}]
@@ -966,13 +970,16 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
     evidence.record("journal_contract", name="root-no-write-or-real-move-failure-and-blocker",
                     status="passed" if journal_ok else "failed")
     process_ok = (result.returncode == 0 and "SCRIPT ERROR" not in output
+                  and "were leaked" not in output
                   and "AI_TOWN_RENDERER" not in output and bool(checks))
     evidence.record("process_check", name="actual-engine-exit",
                     status="passed" if process_ok else "failed")
     failures = (sum(not c["passed"] for c in checks) + int(not isolated)
-                + int(bool(mismatches)) + int(not process_ok) + int(not journal_ok))
-    evidence.finish(status="failed" if failures else "passed", total=len(checks) + 4,
-                    passed=len(checks) + 4 - failures, failed=failures, skipped=0, other=0,
+                + int(bool(mismatches)) + int(not process_ok) + int(not journal_ok)
+                + int(bool(trace_errors)))
+    total = len(checks) + 4 + int(mode == "production-host-flow")
+    evidence.finish(status="failed" if failures else "passed", total=total,
+                    passed=total - failures, failed=failures, skipped=0, other=0,
                     duration_ms=round((time.monotonic() - started) * 1000, 3))
     assert process_ok, output
     assert not failures, checks
