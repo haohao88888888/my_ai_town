@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Updated 2026-10-14. Calibration only until thresholds and final identity are approved. -->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Isolated readonly Bridge" enabled="true">
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments"><collectionProp name="Arguments.arguments"/></elementProp>
+      <stringProp name="TestPlan.user_define_classpath"/>
+    </TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Readonly clients" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <intProp name="LoopController.loops">-1</intProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(clients,1)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(ramp,1)}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,60)}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="Readonly request" enabled="true">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments"><collectionProp name="Arguments.arguments"/></elementProp>
+          <stringProp name="HTTPSampler.domain">127.0.0.1</stringProp>
+          <stringProp name="HTTPSampler.port">${__P(port)}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.path">${requestPath}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">false</boolProp>
+          <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+          <stringProp name="HTTPSampler.connect_timeout">3000</stringProp>
+          <stringProp name="HTTPSampler.response_timeout">5000</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="Deterministic four world / one resident" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="parameters"/>
+            <stringProp name="filename"/>
+            <stringProp name="cacheKey">readonly-routing-v1</stringProp>
+            <stringProp name="script"><![CDATA[
+int n = (vars.get('sampleIndex') ?: '0') as int
+int thread = ctx.getThreadNum()
+synchronized (props) {
+    if (!props.containsKey('ownedJvmIdentityWritten')) {
+        def identity = [pid: java.lang.ProcessHandle.current().pid(), javaHome: System.getProperty('java.home'),
+                        javaVersion: System.getProperty('java.version'), epochMillis: System.currentTimeMillis()]
+        def destination = java.nio.file.Path.of(props.getProperty('ownedJvmIdentityPath'))
+        def pending = java.nio.file.Path.of(props.getProperty('ownedJvmIdentityPath') + '.pending')
+        java.nio.file.Files.writeString(pending, groovy.json.JsonOutput.toJson(identity),
+            java.nio.file.StandardOpenOption.CREATE_NEW)
+        java.nio.file.Files.move(pending, destination)
+        props.put('ownedJvmIdentityWritten', true)
+    }
+}
+def ids = props.getProperty('residentIds').split(',')
+boolean resident = ((n + thread) % 5) == 4
+vars.put('requestPath', resident ? '/residents/' + ids[(n.intdiv(5) + thread) % ids.length] : '/world/state')
+sampler.setName(resident ? 'GET resident' : 'GET world')
+vars.put('sampleIndex', (n + 1).toString())
+]]></stringProp>
+          </JSR223PreProcessor>
+          <hashTree/>
+          <ConstantThroughputTimer guiclass="TestBeanGUI" testclass="ConstantThroughputTimer" testname="Target one request per second per client" enabled="true">
+            <doubleProp><name>throughput</name><value>60.0</value><savedValue>0.0</savedValue></doubleProp>
+            <intProp name="calcMode">0</intProp>
+          </ConstantThroughputTimer>
+          <hashTree/>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="Live identity and readonly contract" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="parameters"/>
+            <stringProp name="filename"/>
+            <stringProp name="cacheKey">readonly-assertion-v1</stringProp>
+            <stringProp name="script"><![CDATA[
+try {
+    assert prev.getResponseCode() == '200' : 'unexpected HTTP status: ' + prev.getResponseCode()
+    def body = new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())
+    assert body.ok == true && body.error == null && body.protocolVersion == '0.1'
+    assert body.requestId && body.data.sessionId == props.getProperty('sessionId')
+    assert body.data.worldGeneration == props.getProperty('worldGeneration')
+    assert body.data.stateVersion instanceof Number && body.data.stateVersion >= 0
+    if (vars.get('requestPath') == '/world/state') {
+        assert body.data.residentCount == 15 && body.data.residents.size() == 15
+        assert body.data.residents.collect { it.residentId }.toSet() == props.getProperty('residentIds').split(',').toList().toSet()
+        assert body.data.simulationSpeed == 1
+    } else {
+        assert body.data.resident.residentId == vars.get('requestPath').substring('/residents/'.length())
+        assert body.data.resident.keySet() == ['residentId','name','currentPlace','spaceId','position','doing','isPresent'].toSet()
+    }
+} catch (Throwable failure) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(failure.toString())
+}
+]]></stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

@@ -1,6 +1,20 @@
-> 更新时间：2026-10-14 20:08 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-15 20:49 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
+
+## JMeter readonly calibration — not formal acceptance (2026-10-15)
+
+`jmeter-readonly.jmx` and `run_jmeter_calibration.py` use the separately installed JMeter 5.6.3 and existing Java, without plugins or environment changes. The generated isolated driver advances the real 15-resident World at 1× and exposes only readonly Bridge HTTP. It does not run a renderer, model decisions or save writes. The existing smoke server does not advance the clock and expires after 20 minutes, so it is not a substitute for this load fixture. Shared resident data is readonly. Real production game/LLM performance is outside this measurement.
+
+Run the actual Godot executable, not its console launcher, and the installed JVM's `bin/java.exe` with sibling `server/jvm.dll`, not Conda's forwarding executable. Internal engine/JVM PIDs must match the owned process IDs. Native Windows counters sample those processes; unknown network/GC/internal-connection metrics remain blind spots. Each run must use a new descendant of `artifacts/`; no failed evidence, profile or save is removed. Cleanup errors and forced stops invalidate success.
+
+The per-thread target is one request/second, with deterministic four-world/one-resident queries and rotating stable resident IDs. Actual throughput and window mix come from JTL. XML JTL retains every response; offline validation uses the archived original Schema. All warmup/tail failures count separately from measurement-window failures, and failed samples are deduplicated from error classifications. Runner/JMX/Schema bytes, source hashes, commands, resources, advancing-world telemetry and exit proof are retained. The fixed window is anchored to the first sample timestamp; two padding seconds allow its end to be observed. This evidence collection has I/O cost and is part of the calibrated workload.
+
+Initial 2026-10-14 calibration used 20 seconds warmup plus 40 seconds measurement: one client measured 40 requests (32 world/8 resident), five clients 200 (160/40), actual 1/5 RPS. All 62/310 samples passed, including warmup/tail; actual engines and JVMs exited zero with no cleanup errors. Raw artifacts are `artifacts/jmeter-calibration-20261014-{1client,5clients}-a1/`. Preparation a1 retained a Groovy-array assertion failure and a misleading wrapper-process sample; it is not a product defect or passed calibration. Short preparation a2 does not prove the later source. The current runner passed Pylint 10/10.
+
+These short runs do not fulfill the formal 1/5/8/10/20-client matrix, 180-second warmup/300-second measurement repeated three times, or 30-minute stability requirement. Formal thresholds still require user approval and a frozen identity. Final-SHA three hosted CI runs, abnormal-save Bridge/Host rejection and actual load/player/error UI evidence remain open. Historical navigation-only UI evidence and 70 local core tests do not close those gaps.
+
+Independent follow-up on 2026-10-15 checked all samples, archived runner/JMX bytes, 2225 fingerprinted game files and actual PID/resource/exit links. The two 40-second runs use their archived runner, not later Python edits. Preflight now explicitly disables inherited proxies/ambient credentials and redirects; probes are registered individually so a second native-open failure cannot lose the first observer handle. Current-runner preparation a4 passed all 17 samples, a complete 10-sample measurement window and clean actual-engine/JVM exits; a3 is rejected and retained because a new test module appeared during its frozen-source check. Neither is formal acceptance. `artifacts/jmeter-calibration-audit-20261015.json` indexes the evidence. Core CI now lints this dependency-compatible Python runner without installing or running JMeter on the hosted job.
 
 ## Genuine Host HTTP/scene flow and restored revision receipts (2026-10-14)
 
