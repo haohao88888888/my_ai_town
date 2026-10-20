@@ -118,9 +118,8 @@ def test_health_and_world_match_protocol_schema(
 ) -> None:
     """Health and world endpoints must match the schema and fixture facts."""
     health = _request_json(http_session, record_bridge_response, bridge_base_url, "/health", 200)
-    world = _request_json(
-        http_session, record_bridge_response, bridge_base_url, "/world/state", 200,
-    )
+    world = _request_json(http_session, record_bridge_response, bridge_base_url,
+                          "/world/state", 200)
 
     response_validator.validate(health)
     response_validator.validate(world)
@@ -163,20 +162,14 @@ def test_world_resident_ids_are_unique_and_detail_is_public_only(
     record_bridge_response: ResponseRecorder,
 ) -> None:
     """Resident IDs stay unique and details expose only the public allowlist."""
-    world = _request_json(
-        http_session, record_bridge_response, bridge_base_url, "/world/state", 200,
-    )
+    world = _request_json(http_session, record_bridge_response, bridge_base_url,
+                          "/world/state", 200)
     residents = world["data"]["residents"]
     resident_ids = [resident["residentId"] for resident in residents]
     assert len(resident_ids) == len(set(resident_ids))
 
-    detail = _request_json(
-        http_session,
-        record_bridge_response,
-        bridge_base_url,
-        f"/residents/{resident_ids[0]}",
-        200,
-    )
+    detail = _request_json(http_session, record_bridge_response, bridge_base_url,
+                           f"/residents/{resident_ids[0]}", 200)
     response_validator.validate(detail)
     public_resident = detail["data"]["resident"]
     assert set(public_resident) == {
@@ -193,17 +186,15 @@ def test_world_resident_ids_are_unique_and_detail_is_public_only(
 
 
 def test_repeated_reads_do_not_change_state_version(
-    http_session: requests.Session,
-    bridge_base_url: str,
+    http_session: requests.Session, bridge_base_url: str,
     record_bridge_response: ResponseRecorder,
 ) -> None:
     """Ten read requests must not mutate revision or world generation."""
     versions = []
     generations = []
     for _ in range(10):
-        body = _request_json(
-            http_session, record_bridge_response, bridge_base_url, "/world/state", 200,
-        )
+        body = _request_json(http_session, record_bridge_response, bridge_base_url,
+                             "/world/state", 200)
         versions.append(body["data"]["stateVersion"])
         generations.append(body["data"]["worldGeneration"])
 
@@ -212,8 +203,7 @@ def test_repeated_reads_do_not_change_state_version(
 
 
 @pytest.mark.parametrize(
-    ("path", "status", "error_code"),
-    [
+    ("path", "status", "error_code"), [
         ("/residents/resident_missing_01", 404, "RESIDENT_NOT_FOUND"),
         ("/missing", 404, "ROUTE_NOT_FOUND"),
         ("/world/state?unexpected=true", 400, "INVALID_PATH"),
@@ -239,16 +229,11 @@ def test_read_errors_are_structured_and_schema_valid(
 
 
 def test_isolated_fixture_is_read_only(
-    http_session: requests.Session,
-    bridge_base_url: str,
+    http_session: requests.Session, bridge_base_url: str,
     record_bridge_response: ResponseRecorder,
 ) -> None:
     """The default isolated fixture must reject all write commands."""
-    response = http_session.post(
-        f"{bridge_base_url}/commands/set-speed",
-        json={},
-        timeout=3.0,
-    )
+    response = http_session.post(f"{bridge_base_url}/commands/set-speed", json={}, timeout=3.0)
     record_bridge_response("POST /commands/set-speed [read-only]", response, 405)
     assert response.status_code == 405
     body = response.json()
@@ -257,17 +242,13 @@ def test_isolated_fixture_is_read_only(
 
 
 def test_non_loopback_host_is_rejected(
-    http_session: requests.Session,
-    bridge_base_url: str,
+    http_session: requests.Session, bridge_base_url: str,
     response_validator: Draft202012Validator,
     record_bridge_response: ResponseRecorder,
 ) -> None:
     """A non-loopback Host header must fail the DNS-rebinding guard."""
-    response = http_session.get(
-        f"{bridge_base_url}/health",
-        headers={"Host": "example.invalid"},
-        timeout=3.0,
-    )
+    response = http_session.get(f"{bridge_base_url}/health",
+                                headers={"Host": "example.invalid"}, timeout=3.0)
     record_bridge_response("GET /health [invalid Host]", response, 403)
     assert response.status_code == 403
     body = response.json()
@@ -632,6 +613,12 @@ func _initialize() -> void:
 	call_deferred("run")
 func run() -> void:
 	spec = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
+	var audio := root.get_node_or_null("TownAudioController")
+	if spec["mode"] == "roots":
+		var storage: Dictionary = audio.call("debug_snapshot")["settingsStorage"]
+		check("audio-autoload-ready-without-formal-io", audio.is_node_ready() and storage == {"path": "", "loadAttempts": 0, "saveAttempts": 0, "persisted": false}, storage)
+		check("audio-unconfigured-save-refused", audio.call("save_settings") == false)
+		check("audio-reject-before-enrollment", audio.call("gametest_configure_settings", String(spec["sandbox"]).path_join("owned/audio_settings.cfg")).get("errorCode") == "GAMETEST_AUDIO_PATH_INVALID")
 	var enrollment := FS.configure_test_retention(spec["sandbox"])
 	check("enrollment", enrollment == OK, int(enrollment))
 	if enrollment != OK:
@@ -645,12 +632,36 @@ func run() -> void:
 		profiles()
 	else:
 		photos()
-	var audio := root.get_node_or_null("TownAudioController")
 	if audio != null and audio.has_method("prepare_shutdown"):
 		audio.call("prepare_shutdown")
 	await create_timer(0.3, true, false, true).timeout
 	quit(0 if checks.all(func(item): return item["passed"]) else 1)
 func roots() -> void:
+	var audio := root.get_node("TownAudioController")
+	var audio_path := String(spec["sandbox"]).path_join("owned/audio_settings.cfg")
+	for candidate: Variant in [null, true, "", "user://audio_settings.cfg", spec["foreign"],
+		String(spec["foreign"]).path_join("audio_settings.cfg"), spec["sandbox"],
+		audio_path + "/", audio_path + "/../escape.cfg", " " + audio_path,
+		audio_path.replace("/owned/", "/owned//"), audio_path.replace("/", "\\")]:
+		var rejected: Dictionary = audio.call("gametest_configure_settings", candidate)
+		check("audio-root-reject-" + str(candidate), rejected.get("errorCode") == "GAMETEST_AUDIO_PATH_INVALID" and audio.get("_gametest_settings_path") == "", rejected)
+	var configured: Dictionary = audio.call("gametest_configure_settings", audio_path)
+	check("audio-owned-settings-persisted", configured.get("ok") == true and configured.get("persisted") == true and FileAccess.file_exists(audio_path), configured)
+	check("audio-root-one-shot", audio.call("gametest_configure_settings", audio_path + "-again.cfg").get("errorCode") == "GAMETEST_AUDIO_ALREADY_CONFIGURED" and audio.get("_gametest_settings_path") == audio_path)
+	var music_bus := AudioServer.get_bus_index("Music")
+	AudioServer.set_bus_volume_db(music_bus, linear_to_db(0.37))
+	check("audio-explicit-native-save", audio.call("save_settings") == true)
+	AudioServer.set_bus_volume_db(music_bus, linear_to_db(0.12))
+	check("audio-native-reload", audio.call("_load_audio_settings") == true and roundi(db_to_linear(AudioServer.get_bus_volume_db(music_bus)) * 100.0) == 37)
+	var persisted := ConfigFile.new()
+	check("audio-persisted-bytes-readable", persisted.load(audio_path) == OK and persisted.get_value("audio", "music_percent") == 37)
+	var original_hash := FileAccess.get_sha256(audio_path)
+	for invalid: String in [String(spec["foreign"]).path_join("new/audio_settings.cfg"), "user://audio_settings.cfg", String(spec["sandbox"]).path_join("owned/photos")]:
+		audio.set("_gametest_settings_path", invalid)
+		check("audio-save-rechecks-path-" + invalid, audio.call("save_settings") == false and audio.call("_load_audio_settings") == false and audio.call("debug_snapshot")["settingsStorage"]["persisted"] == false)
+	audio.set("_gametest_settings_path", audio_path)
+	var storage: Dictionary = audio.call("debug_snapshot")["settingsStorage"]
+	check("audio-io-only-valid-path", storage["loadAttempts"] == 2 and storage["saveAttempts"] == 2 and FileAccess.get_sha256(audio_path) == original_hash, storage)
 	var store := STORE.new()
 	var original: String = store.get("_root")
 	for candidate: Variant in [null, true, 5, "", original, STORE.TEST_ROOT,
@@ -793,7 +804,9 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
 ) -> None:
     """Exercise actual setters/native filesystem; no formal saves or fake cleanup."""
     game = Path(pytestconfig.rootpath).parent
-    source_names = ("agent/AgentFileSystem.gd", "agent/lifecycle/AgentSaveStore.gd",
+    source_names = ("audio/TownAudioController.gd",
+                    "test_bridge/phase2_tests/test_bridge_read_api.py",
+                    "agent/AgentFileSystem.gd", "agent/lifecycle/AgentSaveStore.gd",
                     "world/presentation/session/TownSessionSaveStore.gd",
                     "world/integration/TownConversationPhotoStore.gd",
                     "world/presentation/session/TownStartupSaveCatalog.gd", "agent/AgentJson.gd")
@@ -901,7 +914,7 @@ def test_real_store_root_guards_and_photo_retention(  # pylint: disable=too-many
     evidence = EvidenceStore(tmp_path / "evidence", "godot-root-photo", metadata={
         "caseId": request.node.nodeid, "mode": mode, "sourceFileSha256": fingerprints,
         "driverSha256": hashlib.sha256(driver.read_bytes()).hexdigest(),
-        "scope": {"roots": "actual root setters without filesystem mutations",
+        "scope": {"roots": "actual root setters and isolated autoload audio persistence",
                   "photo": "native photo retention with private enrolled bindings",
                   "threads": "four actual Godot threads, 32 isolated directory moves",
                   "profile": "actual profile publication and failed rename, retained cleanup",

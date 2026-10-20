@@ -1,6 +1,20 @@
-> 更新时间：2026-10-15 20:49 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-20 16:26 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
+
+## Real Host rejection and autoload isolation follow-up (2026-10-20)
+
+The authorized `phase2_tests/test_bridge_host_load_failures.py` exercises actual TCP Bridge/Host rejection, not FakeHost. Targeted `closeout-host-reject-20261020-a1` passed two pytest cases in 89.18 seconds. A real revision-1 World snapshot has one space appended to break its manifest hash; the Agent snapshot changes only `format_version` from 3 to 999. Public responses are respectively HTTP 409 `SESSION_LOAD_RECOVERY_REQUIRED` and `SAVE_VERSION_NEWER_THAN_SUPPORTED`, before departure-save/load registration. Each case preserves the complete World/nonempty task/log/memory projection, all 15 Agent payloads, scene identity, generation/state and file inventories. Each child has 77 native conditions, 97 JSONL/SQLite records, 564 source fingerprints, six real HTTP exchanges and one real Godot health request. These counting units are not extra pytest cases. There is no WS subscription: cursor 0→0 is a bounded server-emission observation, and game event sequence remains null. The targeted execution identity is bdb990c plus the then-untracked module, not the subsequent 8b18967 commit.
+
+The full `closeout-host-reject-full-20261020-a1` passed preflight/static but lost its process handle; no test processes, terminal JUnit or summary were found on follow-up. Its exit cause is unknown and its result is **interrupted/unaccepted**, not 72 passed. All partial artifacts remain. Historical 70-case success is not inherited.
+
+Isolation review found that the Audio autoload still reads formal `user://audio_settings.cfg` and saves defaults when loading fails. Host storage enrollment and headless/no-network startup do not isolate that separate autoload. The current formal file's old write timestamp is not a historical filesystem audit. Earlier isolation statements apply to their explicitly bound stores, not all user configuration. A narrowly authorized Audio configuration guard and existing-test regression are in progress; no GUI run is started on an unproven path. Godot documents [autoload initialization before scenes](https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html) and [persistent user paths](https://docs.godotengine.org/en/stable/tutorials/io/data_paths.html).
+
+The authorized Audio guard now prevents formal configuration reads/writes from the first isolated autoload-ready call. `gametest_configure_settings()` is one-way and requires both the existing isolation argument and an enrolled canonical/link-free `owned` cfg path. Every load/save rechecks the path. Unconfigured saves return false; malformed/unreadable existing files are preserved and block saving until a successful read, instead of being overwritten by defaults. Ordinary production startup retains its previous path and fallback behavior. This is not a malicious-process filesystem sandbox: path-check/open races remain outside the claim.
+
+Targeted `closeout-audio-20261020-a2` passed five cases in 105.48 seconds: the roots/audio persistence case (51 native conditions), two real Host rejection cases (77 each), and malformed-config/native Windows share-read-only write-denial cases (nine each). The native lock permits a real config read but denies writing; it is not a mocked false return. Each failed-IO sample remains byte-identical. These are local dirty-source results, not final-source hosted CI. Earlier a1 passed three cases before the malformed-file protection was added and does not prove the newer code. Normal-mode dynamic startup was deliberately not run against formal audio settings; it remains a source-review-only boundary. GUI `TownAudioDisplaySettingsService` is a separate path with unreviewed cleanup: do not create that service or enter its settings/fullscreen routes in this fixture.
+
+Actual load/player/error UI coverage, approved formal JMeter measurements, final-source three hosted CI runs and requirement-by-requirement acceptance remain open. No failure evidence is deleted and no PR description/comment is changed.
 
 ## JMeter readonly calibration — not formal acceptance (2026-10-15)
 

@@ -2,6 +2,7 @@ extends Node
 
 
 const SOUND_LIBRARY := preload("res://audio/TownProceduralSoundLibrary.gd")
+const GAMETEST_FILE_SYSTEM := preload("res://agent/AgentFileSystem.gd")
 const SETTINGS_PATH := "user://audio_settings.cfg"
 const SETTINGS_SECTION := "audio"
 const DAYLIFE_MUSIC_PATHS := [
@@ -163,6 +164,11 @@ var _thunder_wait_seconds := -1.0
 var _application_paused := false
 var _rng := RandomNumberGenerator.new()
 var _shutdown_prepared := false
+var _gametest_settings_path := ""
+var _settings_load_attempts := 0
+var _settings_save_attempts := 0
+var _settings_persisted := false
+var _gametest_settings_read_failed := false
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -371,7 +377,50 @@ func play_ui_error() -> void:
 	play_cue("ui_error")
 
 
+func gametest_configure_settings(candidate: Variant) -> Dictionary:
+	if not OS.get_cmdline_user_args().has("--gametest-isolated-test"):
+		return {"ok": false, "errorCode": "GAMETEST_AUDIO_ISOLATION_REQUIRED"}
+	if not _gametest_settings_path.is_empty():
+		return {"ok": false, "errorCode": "GAMETEST_AUDIO_ALREADY_CONFIGURED"}
+	if not candidate is String or not _gametest_settings_path_allowed(candidate):
+		return {"ok": false, "errorCode": "GAMETEST_AUDIO_PATH_INVALID"}
+	_gametest_settings_path = candidate
+	var persisted := _load_audio_settings()
+	return {
+		"ok": persisted, "configured": true, "persisted": persisted,
+		"errorCode": "" if persisted else "GAMETEST_AUDIO_SETTINGS_IO_FAILED",
+	}
+
+
+func _gametest_settings_path_allowed(candidate: String) -> bool:
+	return (
+		OS.get_cmdline_user_args().has("--gametest-isolated-test")
+		and not candidate.is_empty() and candidate == candidate.strip_edges()
+		and candidate.is_absolute_path() and not candidate.contains("://")
+		and not candidate.contains("\\") and candidate == candidate.simplify_path()
+		and candidate.get_extension() == "cfg"
+		and GAMETEST_FILE_SYSTEM.is_safe_path_segment(candidate.get_file().get_basename())
+		and GAMETEST_FILE_SYSTEM.test_retention_path_allowed(candidate)
+		and DirAccess.dir_exists_absolute(candidate.get_base_dir())
+		and not DirAccess.dir_exists_absolute(candidate)
+	)
+
+
+func _audio_settings_path() -> String:
+	if not OS.get_cmdline_user_args().has("--gametest-isolated-test"):
+		return SETTINGS_PATH
+	# Autoload ready precedes test enrollment. Never fall back to formal storage.
+	return _gametest_settings_path if _gametest_settings_path_allowed(_gametest_settings_path) else ""
+
+
 func save_settings() -> bool:
+	var settings_path := _audio_settings_path()
+	_settings_persisted = false
+	if settings_path.is_empty() or (
+		OS.get_cmdline_user_args().has("--gametest-isolated-test")
+		and _gametest_settings_read_failed
+	):
+		return false
 	var config := ConfigFile.new()
 	for setting_id: String in BUS_ALIASES:
 		var bus_name := String(BUS_ALIASES[setting_id])
@@ -390,7 +439,9 @@ func save_settings() -> bool:
 			"muted",
 			AudioServer.is_bus_mute(master_index),
 		)
-	return config.save(SETTINGS_PATH) == OK
+	_settings_save_attempts += 1
+	_settings_persisted = config.save(settings_path) == OK
+	return _settings_persisted
 
 
 func debug_snapshot() -> Dictionary:
@@ -411,6 +462,10 @@ func debug_snapshot() -> Dictionary:
 		loaded_base_ambience_ids.append(ambience_id)
 	loaded_base_ambience_ids.sort()
 	return {
+		"settingsStorage": {
+			"path": _audio_settings_path(), "loadAttempts": _settings_load_attempts,
+			"saveAttempts": _settings_save_attempts, "persisted": _settings_persisted,
+		},
 		"musicId": _current_music_id,
 		"musicPoolKey": _current_music_pool_key,
 		"musicVariantIndex": _current_music_variant_index,
@@ -461,9 +516,20 @@ func _ensure_audio_buses() -> void:
 		AudioServer.set_bus_send(bus_index, "Master")
 
 
-func _load_audio_settings() -> void:
+func _load_audio_settings() -> bool:
 	var config := ConfigFile.new()
-	var loaded := config.load(SETTINGS_PATH) == OK
+	var settings_path := _audio_settings_path()
+	var loaded := false
+	_settings_persisted = false
+	if not settings_path.is_empty():
+		_settings_load_attempts += 1
+		var load_error := config.load(settings_path)
+		loaded = load_error == OK
+		if OS.get_cmdline_user_args().has("--gametest-isolated-test"):
+			# A broken or unreadable existing file is evidence, not an empty default.
+			_gametest_settings_read_failed = not loaded and (
+				load_error != ERR_FILE_NOT_FOUND or FileAccess.file_exists(settings_path)
+			)
 	for setting_id: String in BUS_ALIASES:
 		var bus_name := String(BUS_ALIASES[setting_id])
 		var bus_index := AudioServer.get_bus_index(bus_name)
@@ -482,8 +548,10 @@ func _load_audio_settings() -> void:
 			master_index,
 			bool(config.get_value(SETTINGS_SECTION, "muted", false)) if loaded else false,
 		)
-	if not loaded:
-		save_settings()
+	_settings_persisted = loaded
+	if _gametest_settings_read_failed:
+		return false
+	return loaded or (not settings_path.is_empty() and save_settings())
 
 
 func _build_music_players() -> void:

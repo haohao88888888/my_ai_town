@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ctypes
 from os import environ  # pylint: disable=no-name-in-module
 from pathlib import Path
 import subprocess
@@ -163,6 +164,7 @@ def _fingerprints(game: Path) -> dict[str, str]:
              for path in (game / folder).rglob("*")
              if path.is_file() and path.suffix in (".gd", ".tscn", ".gdshader")}
     names.update(game / path for path in (
+        "audio/TownAudioController.gd",
         "test_bridge/GameTestBridge.gd", "test_bridge/protocol.schema.json",
         "test_bridge/phase2_tests/test_bridge_host_load_failures.py",
         "test_bridge/phase2_tests/test_bridge_read_api.py",
@@ -316,3 +318,121 @@ def test_real_host_rejects_invalid_save(  # pylint: disable=too-many-locals,too-
                     duration_ms=round((time.monotonic() - started) * 1000, 3))
     assert process_ok, output
     assert not failures, checks
+
+
+_AUDIO_FAILURE_DRIVER = r'''
+extends SceneTree
+const FS = preload("res://agent/AgentFileSystem.gd")
+var checks: Array = []
+func check(id: String, passed: bool, actual: Variant = null) -> void:
+    checks.append({"id": id, "passed": passed, "actual": actual})
+    print("AUDIO_CHECK " + JSON.stringify(checks.back()))
+func _initialize() -> void:
+    call_deferred("run")
+func run() -> void:
+    var spec: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_cmdline_user_args()[0]))
+    var audio := root.get_node("TownAudioController")
+    var initial: Dictionary = audio.call("debug_snapshot")["settingsStorage"]
+    check("autoload-ready-no-formal-io", audio.is_node_ready() and initial == {"path": "", "loadAttempts": 0, "saveAttempts": 0, "persisted": false}, initial)
+    check("enrollment", FS.configure_test_retention(spec["sandbox"]) == OK)
+    var configured: Dictionary = audio.call("gametest_configure_settings", spec["sample"])
+    var malformed: bool = spec["mode"] == "malformed"
+    check("actual-configure-result", configured.get("ok") == (not malformed) and configured.get("configured") == true, configured)
+    check("read-failure-propagated", not malformed or configured.get("errorCode") == "GAMETEST_AUDIO_SETTINGS_IO_FAILED", configured)
+    check("explicit-save-fails-without-overwrite", audio.call("save_settings") == false)
+    var storage: Dictionary = audio.call("debug_snapshot")["settingsStorage"]
+    check("native-io-attempts-exact", storage["loadAttempts"] == 1 and storage["saveAttempts"] == (0 if malformed else 1) and storage["persisted"] == false, storage)
+    check("one-way-config-keeps-failed-path", audio.call("gametest_configure_settings", String(spec["sample"]) + "-again.cfg").get("errorCode") == "GAMETEST_AUDIO_ALREADY_CONFIGURED")
+    check("sample-bytes-unchanged", FileAccess.get_sha256(spec["sample"]) == spec["sampleSha256"])
+    check("retention-journal-untouched", FileAccess.get_file_as_bytes(String(spec["sandbox"]).path_join("retention.jsonl")).is_empty())
+    audio.call("prepare_shutdown")
+    await create_timer(0.3, true, false, true).timeout
+    quit(0 if checks.all(func(item): return item["passed"]) else 1)
+'''
+
+
+@pytest.mark.parametrize("mode", ("malformed", "write-locked"))
+def test_audio_failure_preserves_owned_configuration(  # pylint: disable=too-many-locals
+    tmp_path: Path, pytestconfig: pytest.Config, godot_executable: Path,
+    request: pytest.FixtureRequest, mode: str,
+) -> None:
+    """Actual autoload/config parsing and Windows write denial, never formal settings."""
+    game = Path(pytestconfig.rootpath).parent
+    sandbox = tmp_path / "gametest-retention-audio-failure"
+    owned = sandbox / "owned"
+    owned.mkdir(parents=True)
+    (sandbox / "retained").mkdir()
+    (sandbox / "retention.jsonl").touch()
+    sample = owned / "audio_settings.cfg"
+    original = b"[audio\nmusic_percent=37\n" if mode == "malformed" else (
+        b"[audio]\nmusic_percent=37\n")
+    sample.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"sandbox": sandbox.as_posix(), "sample": sample.as_posix(),
+                               "sampleSha256": digest, "mode": mode}), encoding="utf-8")
+    driver = tmp_path / "driver.gd"
+    driver.write_text(_AUDIO_FAILURE_DRIVER, encoding="utf-8")
+    fingerprints = _fingerprints(game)
+    evidence = EvidenceStore(tmp_path / "evidence", "godot-audio-failure", metadata={
+        "caseId": request.node.nodeid, "mode": mode, "sourceFileSha256": fingerprints,
+        "driverSha256": hashlib.sha256(driver.read_bytes()).hexdigest(),
+        "sampleSha256": digest, "scope": "isolated real autoload; no formal settings IO"})
+    request.node.user_properties.extend([
+        ("audioFailureRunId", evidence.run_id),
+        ("audioFailureEvidencePath", evidence.jsonl_path.as_posix()),
+        ("audioFailureOutputPath", (tmp_path / "output.log").as_posix()),
+    ])
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = None
+    started = time.monotonic()
+    try:
+        if mode == "write-locked":
+            # Native share-read-only permits actual ConfigFile.load, denies ConfigFile.save.
+            handle = kernel.CreateFileW(str(sample), 0x80000000, 1, None, 3, 0x80, None)
+            assert handle not in (None, ctypes.c_void_p(-1).value), ctypes.get_last_error()
+        result = subprocess.run(
+            [str(godot_executable), "--headless", "--path", str(game), "--log-file",
+             str(tmp_path / "engine.log"), "--script", str(driver), "--", str(spec),
+             "--gametest-isolated-test"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired, AssertionError) as error:
+        output = "".join(part.decode("utf-8", errors="replace") if isinstance(part, bytes)
+                         else part or "" for part in
+                         (getattr(error, "stdout", None), getattr(error, "stderr", None)))
+        (tmp_path / "output.log").write_text(output, encoding="utf-8")
+        evidence.record("process_check", status="failed", details={"reason": str(error)})
+        evidence.finish(status="failed", total=1, passed=0, failed=1, skipped=0, other=0,
+                        duration_ms=(time.monotonic() - started) * 1000)
+        raise
+    finally:
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            kernel.CloseHandle(handle)
+    output = result.stdout + result.stderr
+    (tmp_path / "output.log").write_text(output, encoding="utf-8")
+    checks = [json.loads(line.removeprefix("AUDIO_CHECK ")) for line in result.stdout.splitlines()
+              if line.startswith("AUDIO_CHECK ")]
+    for index, check in enumerate(checks, 1):
+        evidence.record("audio_failure_assertion", name=check["id"],
+                        status="passed" if check["passed"] else "failed", details={
+                            **check, "caseId": request.node.nodeid,
+                            "stepId": f"{request.node.nodeid}::native-{index}"})
+    integrity = (sample.read_bytes() == original and fingerprints == _fingerprints(game)
+                 and (sandbox / "retention.jsonl").read_bytes() == b"")
+    process_ok = (result.returncode == 0 and len(checks) == 9
+                  and not any(marker in output for marker in (
+                      "SCRIPT ERROR", "were leaked", "AI_TOWN_RENDERER")))
+    evidence.record("source_and_sample_integrity", status="passed" if integrity else "failed")
+    evidence.record("process_check", status="passed" if process_ok else "failed",
+                    details={"returncode": result.returncode})
+    failures = sum(not row["passed"] for row in checks) + int(not integrity) + int(not process_ok)
+    evidence.finish(status="failed" if failures else "passed", total=len(checks) + 2,
+                    passed=len(checks) + 2 - failures,
+                    failed=failures, skipped=0, other=0,
+                    duration_ms=(time.monotonic() - started) * 1000)
+    assert not failures, output
