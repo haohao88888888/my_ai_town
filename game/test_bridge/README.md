@@ -1,4 +1,4 @@
-> 更新时间：2026-10-21 09:38 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-21 09:48 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -19,6 +19,10 @@ Targeted `closeout-audio-20261020-a2` passed five cases in 105.48 seconds: the r
 Actual load/player/error UI coverage, approved formal JMeter measurements, final-source three hosted CI runs and requirement-by-requirement acceptance remain open. No failure evidence is deleted and no PR description/comment is changed.
 
 ## JMeter readonly calibration — not formal acceptance (2026-10-15)
+
+New-source b1 on clean b85e905 passed 1/5/8 clients: all 77/385/616 samples, measured 40/200/320 at 1/5/8 RPS, 80/20 mix, no sample failures and complete windows. Measured p95=7/8/9 ms and p99=8/9/12 ms are short-calibration observations only. Ten clients are **rejected**: 20/770 failed attempts overall, 11/400 (2.75%) in the fixed window, all native `HttpHostConnectException`/connection refused before HTTP. Attempt throughput is 10 RPS, successful throughput 9.725 RPS; latency percentiles include all attempts and must not be called successful-service latency. Engine/JVM exit zero and clean ownership shutdown do not override failed requests. Twenty clients were not run after this rejection and remain required.
+
+Raw JTL shows synchronized request bursts despite nominal per-thread pacing. Bridge has eight active slots; the exact [Godot 4.7.2 source](https://github.com/godotengine/godot/blob/4.7.2-stable/core/io/socket_server.h) also defines an eight-entry native pending backlog, used by [the listener](https://github.com/godotengine/godot/blob/4.7.2-stable/core/io/socket_server.cpp). These support a boundary hypothesis, not proven attribution of every refusal. Next isolate burst versus staggered connection behavior with the same request budget and separate evidence; do not increase production limits, suppress errors, silently smooth the original workload or count transport refusal as HTTP success. Three passed b1 cases and the rejected ten-client raw samples/Schema/source/PIDs/exits were independently audited by `artifacts/jmeter-audit-20261021.py`; index `artifacts/jmeter-calibration-audit-20261021.json`. No formal run or threshold acceptance is claimed.
 
 2026-10-21 follow-up on clean d8d2ee2: short 1/5-client runs passed all 62/310 samples and measured 40/200 requests, independently audited against archived JTL/Schema/source/PIDs/exits. The eight-client run is **rejected and retained** despite zero request errors: its last sample starts 95 ms before the fixed window end, so `windowCovered=false`. Ten/twenty clients were not run. ThreadGroup scheduling includes initialization/timer overhead before the first HTTP sample; the previous two-second padding was insufficient. The runner now reserves a bounded 15-second startup allowance plus two tail seconds, records both in environment metadata, and keeps the same first-sample-anchored measurement window and strict coverage gate. This is a harness correction, not a measured product capacity defect; new-source calibration is still required. See [JMeter ThreadGroup scheduling](https://jmeter.apache.org/usermanual/component_reference.html#Thread_Group). No old failed report or assertion is changed.
 
