@@ -1,4 +1,4 @@
-> 更新时间：2026-10-21 09:51 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-21 15:06 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -20,7 +20,22 @@ Actual load/player/error UI coverage, approved formal JMeter measurements, final
 
 ## JMeter readonly calibration — not formal acceptance (2026-10-15)
 
-Load-shape diagnosis now has an explicit `--load-shape burst|phased` switch. Default `burst` retains the existing per-thread pacing; it does not guarantee exact simultaneous starts. Opt-in `phased` delays only the first request of thread i by floor(i × 1000 / client count) ms after preprocessor initialization, with the same one-request/second timer, 80/20 routing, Schema/assertions and fixed observation window. Actual timestamp spacing must be checked from JTL, not assumed from this parameter. The chosen shape is retained in commands/environment/summary. These are separate calibration experiments: a successful phased run cannot replace or erase a rejected burst run. Bridge/engine connection limits are unchanged. Comparative runs are pending; no new result is claimed here.
+### Observed shape comparison and retained protection (2026-10-21)
+
+Clean `16fd5cb5815e26434c7622359c26e300273def78` c1 experiments use 20 seconds warmup and the unchanged 40-second window. Independent artifact auditor `artifacts/jmeter-shape-audit-20261021.py` verifies archived runner/JMX/Schema bytes, 2225 game fingerprints, all responses, sequence/mix, timestamps, advancing World, actual PIDs/resources and zero exits/cleanup errors. Derived index: `artifacts/jmeter-shape-audit-20261021.json`. Raw rejected samples remain unchanged.
+
+| Clients / shape | All samples / failures | Window attempts / failures | Successful RPS | Result |
+|---|---|---|---|---|
+| 10 burst | 770 / 79 | 400 / 42 (10.5%) | 8.95 | Rejected |
+| 10 phased | 761 / 0 | 400 / 0 | 10 | Passed short calibration only |
+| 20 burst | 1540 / 497 | 800 / 243 (30.375%) | 13.925 | Rejected |
+| 20 phased | 1522 / 0 | 800 / 0 | 20 | Passed short calibration only |
+
+Both shapes attempt the same 10/20 RPS and measured 80/20 mix. Observed median full-thread-group start spread is 2/25 ms for ten/twenty burst clients, versus 880/946 ms phased. Phased median inter-request gaps are 95/48 ms, and its busiest 10-ms window contains one request; burst peaks are ten/nineteen. These are start-time clustering metrics, **not** simultaneous in-flight connection counts or backlog measurements. Successful-response p95/p99 are reported separately from all-attempt percentiles. Burst failures include native connection refusal and SocketException before a successful HTTP response; an additional JSON parse diagnostic is not an extra failed request. The previous b1 concentration in one thread did not generalize to this c1 run. This supports sensitivity to traffic shape, not proof of a single refusal mechanism or a performance optimization percentage.
+
+The user chose to retain existing connection protection and measure/report burst boundaries and recovery, rather than require twenty simultaneous burst connections without failure. This is a prospective scope decision, not retroactive acceptance of rejected calibrations. All original 1/5/8/10/20 formal points remain; count every refusal, explicitly verify post-load recovery, and do not call refused requests successful. Formal thresholds, 180-second warmup/300-second measurement ×3, approximately 30-minute stability and the final hosted-CI/UI gates remain open. No Bridge/engine limit, game business code or environment variable changed in this comparison.
+
+Load-shape diagnosis has an explicit `--load-shape burst|phased` switch. Default `burst` retains the existing per-thread pacing; it does not guarantee exact simultaneous starts. Opt-in `phased` delays only the first request of thread i by floor(i × 1000 / client count) ms after preprocessor initialization, with the same one-request/second timer, 80/20 routing, Schema/assertions and fixed observation window. Actual timestamp spacing must be checked from JTL, not assumed from this parameter. The chosen shape is retained in commands/environment/summary. These are separate calibration experiments: a successful phased run cannot replace or erase a rejected burst run. Bridge/engine connection limits are unchanged.
 
 New-source b1 on clean b85e905 passed 1/5/8 clients: all 77/385/616 samples, measured 40/200/320 at 1/5/8 RPS, 80/20 mix, no sample failures and complete windows. Measured p95=7/8/9 ms and p99=8/9/12 ms are short-calibration observations only. Ten clients are **rejected**: 20/770 failed attempts overall, 11/400 (2.75%) in the fixed window, all native `HttpHostConnectException`/connection refused before HTTP. Attempt throughput is 10 RPS, successful throughput 9.725 RPS; latency percentiles include all attempts and must not be called successful-service latency. Engine/JVM exit zero and clean ownership shutdown do not override failed requests. Twenty clients were not run after this rejection and remain required.
 
