@@ -1,6 +1,16 @@
-> 更新时间：2026-10-21 15:13 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-21 20:26 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
+
+## Formal-entry preparation (2026-10-21)
+
+The existing runner now separates calibration, formal 180/300-second measurement and five-client 180/1800-second stability. Formal/stability require the exact clean `--frozen-sha`, original burst workload and preapproved fixed criteria; stability additionally requires three distinct completed five-client formal baseline roots on that SHA. All samples have routing/method/sequence checked before response parsing. No-HTTP failures have explicitly unavailable Schema, remain failed requests and are not converted to successful responses. Only previously understood connection-refused/reset classifications may complete a boundary observation; unknown errors or any actual HTTP/Schema/identity fault invalidate it. Successful-response nearest-rank latency and successful RPS are separate from all-attempt statistics. Shutdown checks now always retain actual exits, forced-stop/error markers and final source identity, including on failures.
+
+`final-validation.json` separately exposes measurement validity, recovery, load-target and report gates. A completed boundary observation with failed requests has `loadTargetPassed=false`, not a green load result. The strict calibration zero-failure gate remains. The authorized new `jmeter_report.py` preserves XML, derives fixed-window CSV and row-to-original-index mappings, then invokes the installed native ReportGenerator API using artifact-only Java source/properties and file logging. Source bytes/hashes, commands, native PID/exit, complete counts and report files are retained. The reviewed configuration excludes only the two nonmandatory deleting disk-buffer graphs; fourteen memory graphs/statistics keep all selected failures. Native throughput/percentile/APDEX display values do not replace the approved fixed-window/verified-success criteria.
+
+Offline preparation checks historical real XML and negative auditor-only mutations; these are not new game measurements or defects. It identified one previously unsplit localized connection-abort at zero-based JTL index 291 in twenty-client c2. Its numeric native code/root cause was not captured, so it remains unclassified and is **not** added to the refused/reset whitelist. All original failed requests/recovery results remain, without relabeling that old run as a formal valid boundary result. The default native-report prototype also executed automatic derived-cache cleanup in two earlier artifact-only runs; this violated the no-deletion constraint. Raw XML/CSV hashes remain unchanged, but no per-file deletion inventory exists, so no historical zero-deletion claim is made. Those prototype records remain; the safe report configuration avoids those consumers. Absence of Preferences warnings is not a complete registry audit.
+
+The implementation is still in preparation, with real end-to-end calibration pending; **no formal long run is completed or claimed**. The actual load/player/error UI, final-source three hosted CI runs and requirement-by-requirement acceptance also remain open. No game business/connection limit, formal save or environment variable was changed.
 
 ## Real Host rejection and autoload isolation follow-up (2026-10-20)
 

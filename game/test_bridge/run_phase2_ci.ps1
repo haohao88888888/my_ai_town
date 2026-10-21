@@ -243,6 +243,7 @@ function Invoke-StaticStage {
         'game/test_bridge/evidence_store.py',
         'game/test_bridge/evidence_import.py',
         'game/test_bridge/run_jmeter_calibration.py',
+        'game/test_bridge/jmeter_report.py',
         'game/test_bridge/phase2_tests'
     ) -LogPath $logPath -Append
     $script:stageReportPaths = @($logPath)

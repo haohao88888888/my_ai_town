@@ -1,4 +1,4 @@
-"""Updated 2026-10-21: isolated readonly calibration, never formal acceptance.
+"""Updated 2026-10-21: isolated readonly calibration and frozen formal measurements.
 
 No environment mutation, recursive deletion, store/Provider access or retries.
 Raw XML JTL retains responses for offline validation using the original Schema.
@@ -13,11 +13,13 @@ import hashlib
 import json
 import math
 import platform
+import runpy
 import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 
 import requests
@@ -26,10 +28,24 @@ from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 BRIDGE = Path(__file__).resolve().parent
 GAME = BRIDGE.parent
 REPO = GAME.parent
+REPORTER = BRIDGE / "jmeter_report.py"
 # ThreadGroup lifetime starts before the first HTTP sample (including JSR223 JIT).
 # Keep the measurement anchored to the first sample; insufficient coverage still fails.
 SCHEDULER_STARTUP_ALLOWANCE_SECONDS = 15
 TAIL_GUARD_SECONDS = 2
+# User confirmed these BEFORE formal measurement; never tune after seeing results.
+FORMAL_CRITERIA = {
+    "approvedOn": "2026-10-21", "scope": "local project targets, NOT production SLA",
+    "baselineClients": [1, 5], "boundaryClients": [8, 10, 20],
+    "baselineAllFailuresMaximum": 0, "successfulP95MsMaximum": 50,
+    "successfulP99MsMaximum": 100, "successfulRpsTargetFractionMinimum": .95,
+    "warmupSeconds": 180, "measurementSeconds": 300, "repetitionsPerPoint": 3,
+    "stabilityClients": 5, "stabilityMeasurementSeconds": 1800,
+    "loadShape": "burst", "sourceMustBeClean": True,
+    "boundaryFailuresRemainFailedRequests": True,
+    "recognizedBoundaryTransports": ["ConnectException/Connection refused",
+                                    "SocketException/Connection reset"],
+}
 DRIVER = r'''extends "res://tests/support/TownWorldTestCase.gd"
 const BRIDGE_SCRIPT := preload("res://test_bridge/GameTestBridge.gd")
 var world: RefCounted
@@ -141,7 +157,8 @@ def source_identity() -> dict:
             "status": subprocess.check_output(
                 ["git", "status", "--porcelain"], cwd=REPO, text=True),
             "hashes": {n: sha(REPO / n) for n in names},
-            "runnerSha256": sha(Path(__file__)), "jmxSha256": sha(BRIDGE / "jmeter-readonly.jmx")}
+            "runnerSha256": sha(Path(__file__)), "jmxSha256": sha(BRIDGE / "jmeter-readonly.jmx"),
+            "reporterSha256": sha(REPORTER)}
 
 
 class MemoryCounters(ctypes.Structure):  # pylint: disable=too-few-public-methods
@@ -242,7 +259,75 @@ def percentile(values: list[int], ratio: float):
     return sorted(values)[max(0, math.ceil(len(values) * ratio) - 1)] if values else None
 
 
-def audit_jtl(  # pylint: disable=too-many-locals,too-many-branches
+def inspect_sample(sample, context):  # pylint: disable=too-many-locals,too-many-branches
+    """Validate request routing even when no HTTP response exists; never fake Schema."""
+    issues, fatal = set(), set()
+    thread = sample.get("tn") or ""
+    ordinal = context["threads"][thread]
+    context["threads"][thread] += 1
+    url = None
+    try:
+        number = int(thread.rsplit("-", 1)[1]) - 1
+        if number < 0:
+            raise ValueError("negative thread index")
+        resident = (ordinal + number) % 5 == 4
+        expected = ("/residents/" + context["ids"][(ordinal // 5 + number) % len(context["ids"])]
+                    if resident else "/world/state")
+        url = urlsplit(sample.findtext("java.net.URL") or "")
+        routing_checks = (sample.tag == "httpSample", sample.findtext("method") == "GET",
+                          sample.get("lb") == ("GET resident" if resident else "GET world"),
+                          url.scheme == "http", url.hostname == "127.0.0.1",
+                          url.port == context["port"], url.username is None,
+                          url.path == expected, not url.query, not url.fragment)
+        if not all(routing_checks):
+            fatal.add("load-sequence-method-or-url-mismatch")
+    except (ValueError, TypeError, IndexError) as error:
+        fatal.add(f"load-routing:{type(error).__name__}")
+    code, message = sample.get("rc") or "", sample.get("rm") or ""
+    raw = sample.findtext("responseData") or ""
+    no_http = code.startswith("Non HTTP response code:")
+    recognized_transport = (
+        (code == "Non HTTP response code: org.apache.http.conn.HttpHostConnectException"
+         and "Connection refused" in message and "java.net.ConnectException" in raw)
+        or (code == "Non HTTP response code: java.net.SocketException"
+            and "Connection reset" in message and "java.net.SocketException" in raw))
+    if no_http:
+        # No body can be Schema-validated. This is still a FAILED request.
+        issues.add(f"transport:{code}")
+        if not recognized_transport or sample.get("s") != "false":
+            fatal.add("unclassified-or-inconsistent-transport-failure")
+        return issues | fatal, fatal, recognized_transport, True
+    if code != "200" or sample.get("s") != "true":
+        fatal.add(f"http-or-live-assertion:{code}")
+    assertions = sample.findall("assertionResult")
+    if (len(assertions) != 1 or any(a.findtext("failure") != "false"
+                                 or a.findtext("error") != "false" for a in assertions)):
+        fatal.add("live-assertion-missing-or-failed")
+    try:
+        body = json.loads(raw)
+        context["validator"].validate(body)
+        data = body["data"]
+        identity_checks = (body["ok"], body["error"] is None,
+                           data["sessionId"] == context["baseline"]["sessionId"],
+                           data["worldGeneration"] == context["baseline"]["worldGeneration"],
+                           data["stateVersion"] >= context["versions"].get(thread, 0),
+                           body["requestId"] not in context["requestIds"])
+        if not all(identity_checks):
+            raise ValueError("identity/version/request ID mismatch")
+        context["versions"][thread] = data["stateVersion"]
+        context["requestIds"].add(body["requestId"])
+        if sample.get("lb") == "GET world":
+            if (data["residentCount"] != 15 or data["simulationSpeed"] != 1
+                    or sorted(r["residentId"] for r in data["residents"]) != context["ids"]):
+                raise ValueError("world population or speed mismatch")
+        elif url is None or data["resident"]["residentId"] != url.path.rsplit("/", 1)[1]:
+            raise ValueError("resident request/response mismatch")
+    except (ValueError, TypeError, KeyError, ValidationError) as error:
+        fatal.add(f"offline-contract:{type(error).__name__}")
+    return issues | fatal, fatal, False, False
+
+
+def audit_jtl(  # pylint: disable=too-many-locals
     path: Path, baseline: dict, warmup: int, measure: int, validator,
 ) -> dict:
     """Offline full schema/identity validation, fixed window anchored to first sample."""
@@ -257,40 +342,20 @@ def audit_jtl(  # pylint: disable=too-many-locals,too-many-branches
     all_errors = Counter()
     failed_indexes = []
     measured_failed_indexes = []
-    thread_indexes = Counter()
+    context = {"baseline": baseline, "validator": validator, "threads": Counter(),
+               "ids": sorted(r["residentId"] for r in baseline["residents"]),
+               "versions": {}, "requestIds": set(),
+               "port": json.loads((path.parent / "spec.json").read_text(encoding="utf-8"))["port"]}
+    contract_invalid, transport_indexes, schema_unavailable = [], [], []
     actual_mix = Counter(s.get("lb") for s in chosen)
-    allowed_ids = {r["residentId"] for r in baseline["residents"]}
     for index, sample in enumerate(samples):
-        issues = set()
-        try:
-            if sample.get("s") != "true" or sample.get("rc") != "200":
-                issues.add(f"http-or-live-assertion:{sample.get('rc')}")
-            thread = sample.get("tn")
-            thread_number = int(thread.rsplit("-", 1)[1]) - 1
-            count = thread_indexes[thread]
-            expected_label = "GET resident" if (count + thread_number) % 5 == 4 else "GET world"
-            thread_indexes[thread] += 1
-            if sample.get("lb") != expected_label or sample.findtext("method") != "GET":
-                issues.add("load-sequence-or-method-mismatch")
-            body = json.loads(sample.findtext("responseData"))
-            validator.validate(body)
-            data = body["data"]
-            if (not body["ok"] or data["sessionId"] != baseline["sessionId"]
-                    or data["worldGeneration"] != baseline["worldGeneration"]):
-                raise ValueError("identity mismatch")
-            url = sample.findtext("java.net.URL") or ""
-            if url.endswith("/world/state"):
-                if (data["residentCount"] != 15 or data["simulationSpeed"] != 1
-                        or {r["residentId"] for r in data["residents"]} != allowed_ids):
-                    raise ValueError("world changed population or speed")
-            elif "/residents/" in url:
-                if data["resident"]["residentId"] != url.rsplit("/", 1)[1]:
-                    raise ValueError("resident request/response mismatch")
-            else:
-                raise ValueError("unexpected sampler path")
-        except (ValueError, TypeError, KeyError, ValidationError) as error:
-            # Calibration keeps every original failure; no sample is silently exempted.
-            issues.add(f"offline-contract:{type(error).__name__}")
+        issues, fatal, transport, no_http = inspect_sample(sample, context)
+        if fatal:
+            contract_invalid.append(index)
+        if transport:
+            transport_indexes.append(index)
+        if no_http:
+            schema_unavailable.append(index)
         if issues:
             failed_indexes.append(index)
             all_errors.update(issues)
@@ -298,12 +363,25 @@ def audit_jtl(  # pylint: disable=too-many-locals,too-many-branches
                 measured_failed_indexes.append(index)
                 errors.update(issues)
     elapsed = [int(s.get("t")) for s in chosen]
-    return {"scope": "calibration, NOT formal acceptance",
+    failed_set = set(failed_indexes)
+    successful = [int(s.get("t")) for i, s in enumerate(samples)
+                  if i not in failed_set and begin <= int(s.get("ts")) < end]
+    return {"scope": "audited samples only; no acceptance implied",
             "sampleTimestampConvention": "JMeter start timestamp",
             "windowStartEpochMs": begin, "windowEndEpochMs": end, "windowSeconds": measure,
             "allSamples": len(samples), "measuredSamples": len(chosen),
             "actualMix": dict(actual_mix),
-            "observedThreadCount": len(thread_indexes),
+            "observedThreadCount": len(context["threads"]),
+            "observedThreadNames": sorted(context["threads"]),
+            "allContractInvalidSampleIndexes": contract_invalid,
+            "recognizedTransportFailureSampleIndexes": transport_indexes,
+            "schemaUnverifiableSampleIndexes": schema_unavailable,
+            "successfulMeasuredSamples": len(successful),
+            "successfulRps": len(successful) / measure,
+            "successfulResponseLatency": {"population": "fully verified measurement responses only",
+                "p50Ms": percentile(successful, .5), "p95Ms": percentile(successful, .95),
+                "p99Ms": percentile(successful, .99), "maxMs": max(successful, default=None)},
+            "attemptLatencyPopulation": "ALL measurement attempts, including failures",
             "worldFraction": actual_mix["GET world"] / len(chosen) if chosen else None,
             "measuredFailedSamples": len(measured_failed_indexes),
             "measuredErrorRate": len(measured_failed_indexes) / len(chosen) if chosen else None,
@@ -317,6 +395,58 @@ def audit_jtl(  # pylint: disable=too-many-locals,too-many-branches
             "maxMs": max(elapsed, default=None), "jtlSha256": sha(path)}
 
 
+def assess_measurement(report: dict, clients: int) -> dict:
+    """Pure policy: valid boundary observation is not a successful load target."""
+    latency = report["successfulResponseLatency"]
+    expected_threads = sorted(f"Readonly clients 1-{n}" for n in range(1, clients + 1))
+    mix = report["actualMix"]
+    valid = all((report["windowCovered"], report["sourceUnchanged"],
+                 not report["allContractInvalidSampleIndexes"],
+                 report["allFailedSamples"] == len(
+                     report["recognizedTransportFailureSampleIndexes"]),
+                 report["observedThreadNames"] == expected_threads,
+                 set(mix) == {"GET world", "GET resident"},
+                 abs(mix.get("GET world", 0) - .8 * report["measuredSamples"]) <= clients))
+    baseline = clients in FORMAL_CRITERIA["baselineClients"]
+    target = all((valid, report["allFailedSamples"] == 0,
+                  latency["p95Ms"] is not None
+                  and latency["p95Ms"] <= FORMAL_CRITERIA["successfulP95MsMaximum"],
+                  latency["p99Ms"] is not None
+                  and latency["p99Ms"] <= FORMAL_CRITERIA["successfulP99MsMaximum"],
+                  report["successfulRps"] >= clients
+                  * FORMAL_CRITERIA["successfulRpsTargetFractionMinimum"])) if baseline else None
+    return {"protocolAndWindowValid": valid, "baselineTargetApplicable": baseline,
+            "loadTargetPassed": target if baseline else (
+                False if report["allFailedSamples"] else None),
+            "zeroFailureObserved": report["allFailedSamples"] == 0,
+            "status": ("baseline-target-met" if target else "baseline-target-failed") if baseline
+                else "boundary-observed-with-failed-requests" if report["allFailedSamples"]
+                else "boundary-observed-without-failed-requests",
+            "scope": "preparation only unless the complete formal/stability run validates"}
+
+
+def verify_stability_prerequisites(args, identity: dict) -> None:
+    """Require three distinct, completed five-client formal baseline roots on this SHA."""
+    roots = [Path(value).resolve(strict=True) for value in args.baseline_runs]
+    if len(roots) != 3 or len(set(roots)) != 3:
+        raise ValueError("Stability requires three distinct completed five-client formal runs")
+    digests = set()
+    for root in roots:
+        if not root.is_relative_to((BRIDGE / "artifacts").resolve()):
+            raise ValueError("Baseline proof must be an approved isolated artifact")
+        before = json.loads((root / "source-before.json").read_text(encoding="utf-8"))
+        final = json.loads((root / "final-validation.json").read_text(encoding="utf-8"))
+        env = json.loads((root / "environment.json").read_text(encoding="utf-8"))
+        if not (before == identity and final["mode"] == "formal"
+                and env["clients"] == 5 and env["warmupSeconds"] == 180
+                and env["measureSeconds"] == 300 and all(final["gates"].values())
+                and final["rawJtlSha256"] == sha(root / "samples.jtl")):
+            raise ValueError("Stability baseline identity/completion/threshold proof mismatch")
+        digests.add(final["rawJtlSha256"])
+    if len(digests) != 3:
+        raise ValueError("Reused baseline artifact bytes are not three independent runs")
+
+
 def probe_recovery(  # pylint: disable=too-many-locals
     root: Path, port: int, baseline: dict, validator, engine_probe,
 ) -> dict:
@@ -325,6 +455,7 @@ def probe_recovery(  # pylint: disable=too-many-locals
     started = time.monotonic()
     deadline = started + 20
     records = []
+    request_ids = set()
     version = baseline["stateVersion"]
     with requests.Session() as session, (root / "recovery-requests.jsonl").open(
             "x", encoding="utf-8") as output:
@@ -348,12 +479,15 @@ def probe_recovery(  # pylint: disable=too-many-locals
                 body = response.json()
                 validator.validate(body)
                 data = body["data"]
-                if (response.status_code != 200 or not body["ok"]
-                        or data["sessionId"] != baseline["sessionId"]
-                        or data["worldGeneration"] != baseline["worldGeneration"]
-                        or data["stateVersion"] < version):
+                identity_checks = (response.status_code == 200, body["ok"],
+                                   data["sessionId"] == baseline["sessionId"],
+                                   data["worldGeneration"] == baseline["worldGeneration"],
+                                   data["stateVersion"] >= version,
+                                   body["requestId"] not in request_ids)
+                if not all(identity_checks):
                     raise ValueError("Recovery status/identity/version mismatch")
                 version = data["stateVersion"]
+                request_ids.add(body["requestId"])
                 if path == "/world/state":
                     if (data["residentCount"] != 15 or data["simulationSpeed"] != 1
                             or sorted(r["residentId"] for r in data["residents"]) != residents):
@@ -445,7 +579,7 @@ def cleanup_owned(  # pylint: disable=too-many-branches
 
 
 def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-    """Own one bounded calibration and retain every intermediate artifact."""
+    """Own one bounded isolated run and retain every intermediate artifact."""
     if platform.system() != "Windows":
         raise ValueError("This resource probe is Windows-only")
     candidate = Path(args.artifacts).absolute()
@@ -465,8 +599,15 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         raise ValueError("Use the installed JVM bin/java.exe, not a Conda launcher")
     identity = source_identity()
     fresh_json(root / "source-before.json", identity)
+    if args.mode != "calibration":
+        if identity["status"] or identity["head"] != args.frozen_sha:
+            raise ValueError("Formal/stability measurement requires the exact clean frozen SHA")
+        fresh_json(root / "fixed-criteria.json", FORMAL_CRITERIA)
+        if args.mode == "stability":
+            verify_stability_prerequisites(args, identity)
     for name, source in (
         ("runner-source.py", Path(__file__)),
+        ("reporter-source.py", REPORTER),
         ("plan-source.jmx", BRIDGE / "jmeter-readonly.jmx"),
         ("response-schema.json", BRIDGE / "protocol.schema.json"),
     ):
@@ -478,8 +619,12 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
+    # Maxima are additive: readiness40 + JVM launch/identity40 + scheduler17 +
+    # request tail5 + post-state5 + offline audit20 + recovery20 + source-check10.
+    # Normal shutdown has its separate 10-second graceful budget.
+    total_budget = args.warmup + args.measure + 157
     fresh_json(root / "spec.json", {"root": root.as_posix(), "port": port,
-                                   "maxSeconds": args.warmup + args.measure + 92})
+                                   "maxSeconds": total_budget})
     fresh_json(root / "environment.json", {
         "platform": platform.platform(), "machine": platform.machine(), **hardware(),
         "processor": platform.processor(), "godot": str(godot), "java": str(java),
@@ -488,6 +633,8 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         "measureSeconds": args.measure, "driverSha256": sha(root / "driver.gd"),
         "schedulerStartupAllowanceSeconds": SCHEDULER_STARTUP_ALLOWANCE_SECONDS,
         "tailGuardSeconds": TAIL_GUARD_SECONDS,
+        "mode": args.mode, "engineLifetimeMaximumSeconds": total_budget,
+        "jvmLifetimeMaximumSeconds": args.warmup + args.measure + 62,
         "loadShape": args.load_shape,
         "phaseOffsetRule": "first request: floor(threadIndex * 1000 / clients) ms"
             if args.load_shape == "phased" else "none; original per-thread pacing",
@@ -555,7 +702,7 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
                 probes.append(ProcessProbe(client.pid))
                 jvm_verified = False
                 identity_deadline = time.monotonic() + 40
-                deadline = time.monotonic() + args.warmup + args.measure + 60
+                deadline = time.monotonic() + args.warmup + args.measure + 62
                 while client.poll() is None:
                     if engine.poll() is not None or time.monotonic() > deadline:
                         raise RuntimeError("Engine exit or bounded JMeter deadline exceeded")
@@ -588,13 +735,17 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
             if after["data"]["time"] == baseline["time"]:
                 raise RuntimeError("World clock did not advance")
             report = audit_jtl(root / "samples.jtl", baseline, args.warmup, args.measure, validator)
+            report["scope"] = "calibration, NOT formal acceptance" if args.mode == "calibration" \
+                else args.mode + " readonly local measurement; target decision is separate"
             report["jmeterExitCode"] = client.returncode
             report["loadShape"] = args.load_shape
             report["sourceUnchanged"] = source_identity() == identity
             report["actualJvmIdentity"] = json.loads(
                 (root / "jvm-identity.json").read_text(encoding="utf-8"))
             # Preserve the load report even if the independent recovery probe fails.
-            fresh_json(root / "calibration-summary.json", report)
+            summary_name = "calibration-summary.json" if args.mode == "calibration" \
+                else "measurement-summary.json"
+            fresh_json(root / summary_name, report)
             recovery = probe_recovery(root, port, baseline, validator, probes[0])
             after_recovery = source_identity()
             fresh_json(root / "source-after-recovery.json", after_recovery)
@@ -602,26 +753,60 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
                 raise RuntimeError("Source changed during post-load recovery")
             if not report["sourceUnchanged"]:
                 raise RuntimeError("Source changed during calibration")
-            if (report["allFailedSamples"] or not report["windowCovered"]
-                    or set(report["actualMix"]) != {"GET world", "GET resident"}
-                    or report["observedThreadCount"] != args.clients):
+            decision = assess_measurement(report, args.clients)
+            fresh_json(root / "target-decision.json", decision)
+            if args.mode == "calibration" and (report["allFailedSamples"]
+                                                or not decision["protocolAndWindowValid"]):
                 raise RuntimeError("Calibration failures or an incomplete observation window")
     except BaseException as error:
         fresh_json(root / "failure.json", {"type": type(error).__name__, "message": str(error)})
         raise
     finally:
         exits = cleanup_owned(root, engine, client, probes)
-    output = (root / "engine-output.log").read_text(encoding="utf-8", errors="replace")
-    if engine.returncode != 0 or any(marker in output for marker in (
-            "SCRIPT ERROR", "AI_TOWN_RENDERER", "were leaked")):
-        raise RuntimeError("Engine shutdown/isolation verification failed; retain all output")
-    if (exits["actualJvmExitCode"] != 0 or exits["cleanupErrors"]
-            or (root / "forced-jvm-stop.json").exists()):
-        raise RuntimeError("Actual JVM did not exit cleanly; not accepted as calibration success")
+        # Always archive shutdown checks, including on rejected calibration or IO errors.
+        output_path = root / "engine-output.log"
+        output = output_path.read_text(encoding="utf-8", errors="replace") \
+            if output_path.exists() else ""
+        after_shutdown = source_identity()
+        fresh_json(root / "source-after-shutdown.json", after_shutdown)
+        shutdown = {"actualEngineExitedZero": engine is not None and engine.returncode == 0,
+                    "actualJvmExitedZero": exits["actualJvmExitCode"] == 0,
+                    "noCleanupErrors": not exits["cleanupErrors"],
+                    "noForcedStops": not any((root / name).exists() for name in (
+                        "forced-jvm-stop.json", "forced-engine-stop.json")),
+                    "noScriptRendererOrLeakMarkers": not any(marker in output for marker in (
+                        "SCRIPT ERROR", "AI_TOWN_RENDERER", "were leaked")),
+                    "sourceUnchanged": after_shutdown == identity}
+        fresh_json(root / "shutdown-validation.json", shutdown)
+    gates = {"measurementValid": decision["protocolAndWindowValid"] and all(shutdown.values()),
+             "recoveryPassed": recovery["attempts"] == 10 and recovery["failures"] == 0,
+             "loadTargetPassed": decision["loadTargetPassed"]}
+    dashboard = None
+    if args.html_report:
+        try:
+            # Pylint 2.14 cannot inspect Python 3.11's frozen runpy module.
+            reporter = runpy.run_path(str(REPORTER))  # pylint: disable=no-member
+            dashboard = reporter["build_report"](root, report, java, jar)
+        except BaseException as error:
+            fresh_json(root / "report-failure.json", {
+                "type": type(error).__name__, "message": str(error)})
+            raise
+    gates["reportVerified"] = not args.html_report or dashboard is not None
+    after_report = source_identity()
+    fresh_json(root / "source-after-report.json", after_report)
+    gates["measurementValid"] = gates["measurementValid"] and after_report == identity
     fresh_json(root / "final-validation.json", {
         "engineExitCode": engine.returncode, "sourceUnchanged": report["sourceUnchanged"],
-        "scope": "calibration only", "rawJtlSha256": report["jtlSha256"],
+        "scope": "calibration only" if args.mode == "calibration" else decision["status"],
+        "mode": args.mode, "gates": gates, "rawJtlSha256": report["jtlSha256"],
+        "reportRequested": args.html_report, "dashboard": dashboard,
         "recoveryRequestsSha256": recovery["requestsSha256"]})
+    if (not gates["measurementValid"] or not gates["recoveryPassed"]
+            or (decision["baselineTargetApplicable"] and args.mode != "calibration"
+                and not gates["loadTargetPassed"])):
+        fresh_json(root / "failure.json", {
+            "type": "FormalGateFailure", "gates": gates, "mode": args.mode})
+        raise RuntimeError("Completed measurement/target gate failed; all evidence retained")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -632,11 +817,31 @@ if __name__ == "__main__":
     parser.add_argument("--java", required=True)
     parser.add_argument("--jmeter-jar", required=True)
     parser.add_argument("--clients", type=int, choices=(1, 5, 8, 10, 20), default=1)
+    parser.add_argument("--mode", choices=("calibration", "formal", "stability"),
+                        default="calibration")
+    parser.add_argument("--frozen-sha")
+    parser.add_argument("--html-report", action="store_true",
+                        help="optional for calibration; mandatory for formal/stability")
+    parser.add_argument("--baseline-runs", nargs=3, default=[])
     parser.add_argument("--load-shape", choices=("burst", "phased"), default="burst",
                         help="phased is a separate diagnostic; never replaces the original burst")
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--measure", type=int, default=40)
+    parser.add_argument("--warmup", type=int)
+    parser.add_argument("--measure", type=int)
     options = parser.parse_args()
-    if not 1 <= options.warmup <= 300 or not 5 <= options.measure <= 600:
+    required_durations = (180, 1800 if options.mode == "stability" else 300)
+    if options.mode == "calibration":
+        options.warmup = 20 if options.warmup is None else options.warmup
+        options.measure = 40 if options.measure is None else options.measure
+    else:
+        options.html_report = True
+        if (options.load_shape != "burst" or not options.frozen_sha
+                or options.warmup not in (None, required_durations[0])
+                or options.measure not in (None, required_durations[1])):
+            parser.error("Formal/stability needs frozen SHA, burst and fixed 180/300 or 180/1800")
+        options.warmup, options.measure = required_durations
+        if options.mode == "stability" and (options.clients != 5 or not options.baseline_runs):
+            parser.error("Stability needs five clients and three completed formal baseline roots")
+    if options.mode == "calibration" and (
+            not 1 <= options.warmup <= 300 or not 5 <= options.measure <= 600):
         parser.error("Calibration needs warmup 1..300 and measurement 5..600 seconds")
     run(options)
