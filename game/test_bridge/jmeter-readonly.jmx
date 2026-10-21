@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Updated 2026-10-14. Calibration only until thresholds and final identity are approved. -->
+<!-- Updated 2026-10-21. Calibration only; phased traffic is a separate diagnostic, not a burst replacement. -->
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Isolated readonly Bridge" enabled="true">
@@ -58,6 +58,11 @@ synchronized (props) {
         java.nio.file.Files.move(pending, destination)
         props.put('ownedJvmIdentityWritten', true)
     }
+}
+// The default workload is unchanged. Opt-in phase spreading is diagnostic only;
+// the first preprocessor compilation must complete before applying the offset.
+if (n == 0 && props.getProperty('loadShape', 'burst') == 'phased') {
+    Thread.sleep((long) (thread * 1000L / Integer.parseInt(props.getProperty('clients'))))
 }
 def ids = props.getProperty('residentIds').split(',')
 boolean resident = ((n + thread) % 5) == 4

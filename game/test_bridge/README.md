@@ -1,4 +1,4 @@
-> 更新时间：2026-10-21 09:48 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-21 09:51 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -19,6 +19,8 @@ Targeted `closeout-audio-20261020-a2` passed five cases in 105.48 seconds: the r
 Actual load/player/error UI coverage, approved formal JMeter measurements, final-source three hosted CI runs and requirement-by-requirement acceptance remain open. No failure evidence is deleted and no PR description/comment is changed.
 
 ## JMeter readonly calibration — not formal acceptance (2026-10-15)
+
+Load-shape diagnosis now has an explicit `--load-shape burst|phased` switch. Default `burst` retains the existing per-thread pacing; it does not guarantee exact simultaneous starts. Opt-in `phased` delays only the first request of thread i by floor(i × 1000 / client count) ms after preprocessor initialization, with the same one-request/second timer, 80/20 routing, Schema/assertions and fixed observation window. Actual timestamp spacing must be checked from JTL, not assumed from this parameter. The chosen shape is retained in commands/environment/summary. These are separate calibration experiments: a successful phased run cannot replace or erase a rejected burst run. Bridge/engine connection limits are unchanged. Comparative runs are pending; no new result is claimed here.
 
 New-source b1 on clean b85e905 passed 1/5/8 clients: all 77/385/616 samples, measured 40/200/320 at 1/5/8 RPS, 80/20 mix, no sample failures and complete windows. Measured p95=7/8/9 ms and p99=8/9/12 ms are short-calibration observations only. Ten clients are **rejected**: 20/770 failed attempts overall, 11/400 (2.75%) in the fixed window, all native `HttpHostConnectException`/connection refused before HTTP. Attempt throughput is 10 RPS, successful throughput 9.725 RPS; latency percentiles include all attempts and must not be called successful-service latency. Engine/JVM exit zero and clean ownership shutdown do not override failed requests. Twenty clients were not run after this rejection and remain required.
 

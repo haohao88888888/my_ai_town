@@ -423,6 +423,9 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         "measureSeconds": args.measure, "driverSha256": sha(root / "driver.gd"),
         "schedulerStartupAllowanceSeconds": SCHEDULER_STARTUP_ALLOWANCE_SECONDS,
         "tailGuardSeconds": TAIL_GUARD_SECONDS,
+        "loadShape": args.load_shape,
+        "phaseOffsetRule": "first request: floor(threadIndex * 1000 / clients) ms"
+            if args.load_shape == "phased" else "none; original per-thread pacing",
         "loadModel": "closed-loop; target 1 req/s/client; actual RPS reported",
         "blindSpots": ["No production renderer or model decisions",
                        "No network bandwidth, GC or per-connection access log",
@@ -466,6 +469,7 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
                 str(BRIDGE / "jmeter-readonly.jmx"), "-l", str(root / "samples.jtl"),
                 "-j", str(root / "jmeter.log"), f"-Jport={port}", f"-Jclients={args.clients}",
                 "-Jramp=1", f"-Jduration={scheduled_seconds}",
+                f"-JloadShape={args.load_shape}",
                 "-JownedJvmIdentityPath=" + str(root / "jvm-identity.json"),
                 "-JresidentIds=" + ",".join(resident_ids), "-JsessionId=" + baseline["sessionId"],
                 "-JworldGeneration=" + baseline["worldGeneration"], "-Jhttpclient4.retrycount=0",
@@ -520,6 +524,7 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
                 raise RuntimeError("World clock did not advance")
             report = audit_jtl(root / "samples.jtl", baseline, args.warmup, args.measure, validator)
             report["jmeterExitCode"] = client.returncode
+            report["loadShape"] = args.load_shape
             report["sourceUnchanged"] = source_identity() == identity
             report["actualJvmIdentity"] = json.loads(
                 (root / "jvm-identity.json").read_text(encoding="utf-8"))
@@ -555,6 +560,8 @@ if __name__ == "__main__":
     parser.add_argument("--java", required=True)
     parser.add_argument("--jmeter-jar", required=True)
     parser.add_argument("--clients", type=int, choices=(1, 5, 8, 10, 20), default=1)
+    parser.add_argument("--load-shape", choices=("burst", "phased"), default="burst",
+                        help="phased is a separate diagnostic; never replaces the original burst")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--measure", type=int, default=40)
     options = parser.parse_args()
