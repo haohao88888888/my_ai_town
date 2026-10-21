@@ -1,4 +1,4 @@
-"""Updated 2026-10-14: isolated readonly calibration, never formal acceptance.
+"""Updated 2026-10-21: isolated readonly calibration, never formal acceptance.
 
 No environment mutation, recursive deletion, store/Provider access or retries.
 Raw XML JTL retains responses for offline validation using the original Schema.
@@ -26,6 +26,10 @@ from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 BRIDGE = Path(__file__).resolve().parent
 GAME = BRIDGE.parent
 REPO = GAME.parent
+# ThreadGroup lifetime starts before the first HTTP sample (including JSR223 JIT).
+# Keep the measurement anchored to the first sample; insufficient coverage still fails.
+SCHEDULER_STARTUP_ALLOWANCE_SECONDS = 15
+TAIL_GUARD_SECONDS = 2
 DRIVER = r'''extends "res://tests/support/TownWorldTestCase.gd"
 const BRIDGE_SCRIPT := preload("res://test_bridge/GameTestBridge.gd")
 var world: RefCounted
@@ -417,6 +421,8 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         "jmeterJar": str(jar), "godotSha256": sha(godot), "javaSha256": sha(java),
         "jmeterJarSha256": sha(jar), "clients": args.clients, "warmupSeconds": args.warmup,
         "measureSeconds": args.measure, "driverSha256": sha(root / "driver.gd"),
+        "schedulerStartupAllowanceSeconds": SCHEDULER_STARTUP_ALLOWANCE_SECONDS,
+        "tailGuardSeconds": TAIL_GUARD_SECONDS,
         "loadModel": "closed-loop; target 1 req/s/client; actual RPS reported",
         "blindSpots": ["No production renderer or model decisions",
                        "No network bandwidth, GC or per-connection access log",
@@ -453,11 +459,13 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
             resident_ids = sorted(r["residentId"] for r in baseline["residents"])
             for resident in resident_ids:
                 request_json(port, "/residents/" + resident, validator)
+            scheduled_seconds = (args.warmup + args.measure + SCHEDULER_STARTUP_ALLOWANCE_SECONDS
+                                 + TAIL_GUARD_SECONDS)
             args_jmeter = [
                 str(java), "-Xms256m", "-Xmx512m", "-jar", str(jar), "-n", "-t",
                 str(BRIDGE / "jmeter-readonly.jmx"), "-l", str(root / "samples.jtl"),
                 "-j", str(root / "jmeter.log"), f"-Jport={port}", f"-Jclients={args.clients}",
-                "-Jramp=1", f"-Jduration={args.warmup + args.measure + 2}",
+                "-Jramp=1", f"-Jduration={scheduled_seconds}",
                 "-JownedJvmIdentityPath=" + str(root / "jvm-identity.json"),
                 "-JresidentIds=" + ",".join(resident_ids), "-JsessionId=" + baseline["sessionId"],
                 "-JworldGeneration=" + baseline["worldGeneration"], "-Jhttpclient4.retrycount=0",
