@@ -317,6 +317,71 @@ def audit_jtl(  # pylint: disable=too-many-locals,too-many-branches
             "maxMs": max(elapsed, default=None), "jtlSha256": sha(path)}
 
 
+def probe_recovery(  # pylint: disable=too-many-locals
+    root: Path, port: int, baseline: dict, validator, engine_probe,
+) -> dict:
+    """Ten real low-rate requests to the same World after JVM exit; never retry."""
+    residents = sorted(r["residentId"] for r in baseline["residents"])
+    started = time.monotonic()
+    deadline = started + 20
+    records = []
+    version = baseline["stateVersion"]
+    with requests.Session() as session, (root / "recovery-requests.jsonl").open(
+            "x", encoding="utf-8") as output:
+        session.trust_env = False
+        for index in range(10):
+            time.sleep(max(0, started + index - time.monotonic()))
+            path = "/residents/" + residents[index // 5] if index % 5 == 4 else "/world/state"
+            entry = {"probeId": f"recovery-{index + 1:02d}", "method": "GET", "path": path,
+                     "sentEpochSeconds": time.time(), "gameEventSequence": None,
+                     "gameEventSequenceReason": "HTTP readonly probe; no WS subscription"}
+            request_started = time.monotonic()
+            try:
+                if request_started >= deadline:
+                    raise RuntimeError("Bounded recovery deadline reached")
+                response = session.get(f"http://127.0.0.1:{port}{path}",
+                                       timeout=min(3, deadline - request_started),
+                                       allow_redirects=False)
+                entry.update(status=response.status_code, responseHeaders=dict(response.headers),
+                             rawResponse=response.text, requestUrl=response.request.url)
+                response.raise_for_status()
+                body = response.json()
+                validator.validate(body)
+                data = body["data"]
+                if (response.status_code != 200 or not body["ok"]
+                        or data["sessionId"] != baseline["sessionId"]
+                        or data["worldGeneration"] != baseline["worldGeneration"]
+                        or data["stateVersion"] < version):
+                    raise ValueError("Recovery status/identity/version mismatch")
+                version = data["stateVersion"]
+                if path == "/world/state":
+                    if (data["residentCount"] != 15 or data["simulationSpeed"] != 1
+                            or sorted(r["residentId"] for r in data["residents"]) != residents):
+                        raise ValueError("Recovery World population/speed mismatch")
+                elif data["resident"]["residentId"] != path.rsplit("/", 1)[1]:
+                    raise ValueError("Recovery resident request mismatch")
+                entry.update(requestId=body["requestId"], worldGeneration=data["worldGeneration"],
+                             stateVersion=data["stateVersion"], actualGodot=engine_probe.sample(),
+                             passed=True)
+            except Exception as error:  # pylint: disable=broad-except
+                # Preserve failed transport/Schema/IO evidence before propagating.
+                entry.update(passed=False, errorType=type(error).__name__, errorMessage=str(error))
+                raise
+            finally:
+                entry.update(receivedEpochSeconds=time.time(),
+                             elapsedMs=(time.monotonic() - request_started) * 1000)
+                output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                output.flush()
+                records.append(entry)
+    result = {"scope": "post-load recovery only, NOT acceptance of preceding load",
+              "attempts": len(records), "failures": sum(not r["passed"] for r in records),
+              "targetRequestsPerSecond": 1, "elapsedSeconds": time.monotonic() - started,
+              "worldGeneration": baseline["worldGeneration"], "finalStateVersion": version,
+              "requestsSha256": sha(root / "recovery-requests.jsonl")}
+    fresh_json(root / "recovery-summary.json", result)
+    return result
+
+
 def cleanup_owned(  # pylint: disable=too-many-branches
     root: Path, engine, client, probes: list,
 ) -> dict:
@@ -528,7 +593,13 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
             report["sourceUnchanged"] = source_identity() == identity
             report["actualJvmIdentity"] = json.loads(
                 (root / "jvm-identity.json").read_text(encoding="utf-8"))
+            # Preserve the load report even if the independent recovery probe fails.
             fresh_json(root / "calibration-summary.json", report)
+            recovery = probe_recovery(root, port, baseline, validator, probes[0])
+            after_recovery = source_identity()
+            fresh_json(root / "source-after-recovery.json", after_recovery)
+            if after_recovery != identity:
+                raise RuntimeError("Source changed during post-load recovery")
             if not report["sourceUnchanged"]:
                 raise RuntimeError("Source changed during calibration")
             if (report["allFailedSamples"] or not report["windowCovered"]
@@ -549,7 +620,8 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         raise RuntimeError("Actual JVM did not exit cleanly; not accepted as calibration success")
     fresh_json(root / "final-validation.json", {
         "engineExitCode": engine.returncode, "sourceUnchanged": report["sourceUnchanged"],
-        "scope": "calibration only", "rawJtlSha256": report["jtlSha256"]})
+        "scope": "calibration only", "rawJtlSha256": report["jtlSha256"],
+        "recoveryRequestsSha256": recovery["requestsSha256"]})
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

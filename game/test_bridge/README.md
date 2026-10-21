@@ -1,4 +1,4 @@
-> 更新时间：2026-10-21 15:06 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-21 15:08 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -21,6 +21,8 @@ Actual load/player/error UI coverage, approved formal JMeter measurements, final
 ## JMeter readonly calibration — not formal acceptance (2026-10-15)
 
 ### Observed shape comparison and retained protection (2026-10-21)
+
+The runner now adds a separate post-load recovery probe after JMeter exits, before evaluating the existing load-failure gate: ten actual readonly requests, one-second target spacing, no retries, same owned engine/World and unchanged connection limits. Each response/transport failure, request ID, generation/version, timestamps and actual engine resource counters are retained in `recovery-requests.jsonl`; failure is rethrown. Successful probes produce `recovery-summary.json`, with a second source-identity check after recovery. The probe is bounded and never resets/restarts the World. This implementation still needs fresh calibration; no recovery pass is claimed from the earlier c1 runs. A recovered server does not make the preceding rejected load pass.
 
 Clean `16fd5cb5815e26434c7622359c26e300273def78` c1 experiments use 20 seconds warmup and the unchanged 40-second window. Independent artifact auditor `artifacts/jmeter-shape-audit-20261021.py` verifies archived runner/JMX/Schema bytes, 2225 game fingerprints, all responses, sequence/mix, timestamps, advancing World, actual PIDs/resources and zero exits/cleanup errors. Derived index: `artifacts/jmeter-shape-audit-20261021.json`. Raw rejected samples remain unchanged.
 
