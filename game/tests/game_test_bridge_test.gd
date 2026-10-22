@@ -197,6 +197,7 @@ func _test_generation_adapter(data: Dictionary) -> void:
 	var real_world := _world
 	var rejected_command := _command("missing-generation-command")
 	var source_id := real_world.get_instance_id()
+	var source_speed: int = real_world.call("get_simulation_speed")
 	var source_generation: Variant = real_world.get("_runtime_generation")
 	_expect(source_generation is int and source_generation > 0, "real lifecycle generation is a positive integer")
 	var event_sequence: int = _bridge.get("_event_sequence")
@@ -244,6 +245,9 @@ func _test_generation_adapter(data: Dictionary) -> void:
 			stale.expectedWorldGeneration = before.worldGeneration
 			_expect_error(await _exchange(_post(stale)), 409, "WORLD_GENERATION_CONFLICT")
 			_expect_equal((await _exchange(_post(_command("post-restore-generation")))).get("status"), 200, "fresh restored generation executes")
+	# Restore the real initial speed: later event tests must observe an actual change.
+	_expect_equal((await _exchange(_post(_command("generation-adapter-restore-speed", source_speed)))).get("status"), 200, "generation test restores prior speed through the Bridge")
+	_expect_equal(real_world.call("get_simulation_speed"), source_speed, "generation test leaves no speed pollution")
 	_bridge.stop()
 	_expect_equal(_bridge.start(_context, _port).get("ok"), true, "generation adapter test restores readonly listener")
 
