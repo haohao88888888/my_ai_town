@@ -1,4 +1,4 @@
-"""Updated 2026-10-21: isolated readonly calibration and frozen formal measurements.
+"""Updated 2026-10-22: isolated readonly calibration and frozen formal measurements.
 
 No environment mutation, recursive deletion, store/Provider access or retries.
 Raw XML JTL retains responses for offline validation using the original Schema.
@@ -33,6 +33,7 @@ REPORTER = BRIDGE / "jmeter_report.py"
 # Keep the measurement anchored to the first sample; insufficient coverage still fails.
 SCHEDULER_STARTUP_ALLOWANCE_SECONDS = 15
 TAIL_GUARD_SECONDS = 2
+PREFLIGHT_BUDGET_SECONDS = 30
 # User confirmed these BEFORE formal measurement; never tune after seeing results.
 FORMAL_CRITERIA = {
     "approvedOn": "2026-10-21", "scope": "local project targets, NOT production SLA",
@@ -241,16 +242,22 @@ def hardware() -> dict:
             "installedRamBytes": installed_kib.value * 1024 if success else None}
 
 
-def request_json(port: int, path: str, validator) -> dict:
+def request_json(port: int, path: str, validator, deadline: float | None = None) -> dict:
     """Bounded, non-retrying read of the owned loopback bridge."""
+    remaining = deadline - time.monotonic() if deadline is not None else 10
+    if remaining <= 0:
+        raise TimeoutError("Owned readonly preflight total deadline exceeded")
     with requests.Session() as session:
         session.trust_env = False  # Do not inherit proxies or ambient .netrc credentials.
         response = session.get(
-            f"http://127.0.0.1:{port}{path}", timeout=5, allow_redirects=False)
+            f"http://127.0.0.1:{port}{path}", timeout=min(5, remaining / 2),
+            allow_redirects=False)
         if response.status_code != 200:
             raise ValueError(f"Owned readonly preflight returned HTTP {response.status_code}")
         body = response.json()
     validator.validate(body)
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("Owned readonly preflight completed after its total deadline")
     return body
 
 
@@ -296,6 +303,17 @@ def inspect_sample(sample, context):  # pylint: disable=too-many-locals,too-many
         issues.add(f"transport:{code}")
         if not recognized_transport or sample.get("s") != "false":
             fatal.add("unclassified-or-inconsistent-transport-failure")
+        # A known network refusal cannot hide an absent/broken Groovy assertion.
+        # This exact message comes from the first assertion in the archived JMX.
+        expected_assertion = (
+            "java.lang.AssertionError: unexpected HTTP status: " + code
+            + ". Expression: (prev.getResponseCode() == 200)")
+        assertions = sample.findall("assertionResult")
+        if len(assertions) != 1 or any(
+                a.findtext("name") != "Live identity and readonly contract"
+                or a.findtext("failure") != "true" or a.findtext("error") != "false"
+                or a.findtext("failureMessage") != expected_assertion for a in assertions):
+            fatal.add("transport-live-assertion-missing-or-unexpected")
         return issues | fatal, fatal, recognized_transport, True
     if code != "200" or sample.get("s") != "true":
         fatal.add(f"http-or-live-assertion:{code}")
@@ -619,10 +637,10 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    # Maxima are additive: readiness40 + JVM launch/identity40 + scheduler17 +
+    # Reserved budgets: readiness40 + whole preflight30 + JVM identity40 + scheduler17 +
     # request tail5 + post-state5 + offline audit20 + recovery20 + source-check10.
     # Normal shutdown has its separate 10-second graceful budget.
-    total_budget = args.warmup + args.measure + 157
+    total_budget = args.warmup + args.measure + 157 + PREFLIGHT_BUDGET_SECONDS
     fresh_json(root / "spec.json", {"root": root.as_posix(), "port": port,
                                    "maxSeconds": total_budget})
     fresh_json(root / "environment.json", {
@@ -633,6 +651,7 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
         "measureSeconds": args.measure, "driverSha256": sha(root / "driver.gd"),
         "schedulerStartupAllowanceSeconds": SCHEDULER_STARTUP_ALLOWANCE_SECONDS,
         "tailGuardSeconds": TAIL_GUARD_SECONDS,
+        "preflightTotalBudgetSeconds": PREFLIGHT_BUDGET_SECONDS,
         "mode": args.mode, "engineLifetimeMaximumSeconds": total_budget,
         "jvmLifetimeMaximumSeconds": args.warmup + args.measure + 62,
         "loadShape": args.load_shape,
@@ -663,17 +682,18 @@ def run(args) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-
             ready = json.loads((root / "ready.json").read_text(encoding="utf-8"))
             if ready["pid"] != engine.pid or ready["port"] != port:
                 raise RuntimeError("Actual engine/listener ownership mismatch")
-            health = request_json(port, "/health", validator)
+            preflight_deadline = time.monotonic() + PREFLIGHT_BUDGET_SECONDS
+            health = request_json(port, "/health", validator, preflight_deadline)
             if health["data"] != {"bridgeReady": True, "worldReady": True, "readOnly": True}:
                 raise RuntimeError("Read-only readiness mismatch")
-            before = request_json(port, "/world/state", validator)
+            before = request_json(port, "/world/state", validator, preflight_deadline)
             baseline = before["data"]
             if baseline["residentCount"] != 15 or baseline["simulationSpeed"] != 1:
                 raise RuntimeError("Not the planned 15-resident/1x fixture")
             fresh_json(root / "baseline.json", before)
             resident_ids = sorted(r["residentId"] for r in baseline["residents"])
             for resident in resident_ids:
-                request_json(port, "/residents/" + resident, validator)
+                request_json(port, "/residents/" + resident, validator, preflight_deadline)
             scheduled_seconds = (args.warmup + args.measure + SCHEDULER_STARTUP_ALLOWANCE_SECONDS
                                  + TAIL_GUARD_SECONDS)
             args_jmeter = [

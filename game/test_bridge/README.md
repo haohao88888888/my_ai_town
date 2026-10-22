@@ -1,4 +1,4 @@
-> 更新时间：2026-10-21 20:26 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-22 09:37 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
 
@@ -10,7 +10,9 @@ The existing runner now separates calibration, formal 180/300-second measurement
 
 Offline preparation checks historical real XML and negative auditor-only mutations; these are not new game measurements or defects. It identified one previously unsplit localized connection-abort at zero-based JTL index 291 in twenty-client c2. Its numeric native code/root cause was not captured, so it remains unclassified and is **not** added to the refused/reset whitelist. All original failed requests/recovery results remain, without relabeling that old run as a formal valid boundary result. The default native-report prototype also executed automatic derived-cache cleanup in two earlier artifact-only runs; this violated the no-deletion constraint. Raw XML/CSV hashes remain unchanged, but no per-file deletion inventory exists, so no historical zero-deletion claim is made. Those prototype records remain; the safe report configuration avoids those consumers. Absence of Preferences warnings is not a complete registry audit.
 
-The implementation is still in preparation, with real end-to-end calibration pending; **no formal long run is completed or claimed**. The actual load/player/error UI, final-source three hosted CI runs and requirement-by-requirement acceptance also remain open. No game business/connection limit, formal save or environment variable was changed.
+The clean `d7ec7ec` end-to-end preparation `jmeter-formal-entry-20261021-1client-prepare-d1` completed 23 total samples, a five-sample/five-second window without failures, ten same-engine recovery requests, clean actual exits and a verified native HTML report. Its 144 manifested report files were independently checked; static validation passed. This is a calibration preparation only, not a formal 300-second repetition. Review then required stronger transport assertion integrity and a shared 30-second preflight acceptance deadline; the current runner checks both before and after each preflight request, allocates its connect/read inactivity timeouts from remaining budget, and reserves that budget in the engine timer. This is fail-closed deadline validation, not an OS-level interruption guarantee for arbitrarily streaming responses. Every non-HTTP sample must retain exactly the expected HTTP-status assertion, not hide absent assertions, extra assertions or Groovy errors behind a known refusal. Thirty-four offline preparation checks passed, including six negative transport assertion checks and an expired deadline check; these are auditor checks, not game test cases. The revised source still needs a fresh real preparation before freezing the long matrix.
+
+**No formal long run is completed or claimed.** The actual load/player/error UI, final-source three hosted CI runs and requirement-by-requirement acceptance also remain open. No game business/connection limit, formal save or environment variable was changed.
 
 ## Real Host rejection and autoload isolation follow-up (2026-10-20)
 
