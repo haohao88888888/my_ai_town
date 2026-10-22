@@ -19,9 +19,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 # Match the existing suite's namespace-package workaround for Pylint 2.14.5.
 from game.test_bridge.evidence_store import EvidenceStore  # pylint: disable=import-error
-from game.test_bridge.phase2_tests.test_evidence_import import (  # pylint: disable=import-error
-    _audit_retention_journal,
-)
+from game.test_bridge.phase2_tests.test_evidence_import import _audit_retention_journal  # pylint: disable=import-error
 from game.test_bridge.phase2_tests.test_bridge_command_api import (  # pylint: disable=import-error
     prepare_native_case_files, prepare_host_flow_driver, record_host_flow_trace,
 )
