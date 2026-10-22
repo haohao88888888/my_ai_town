@@ -266,6 +266,17 @@ def percentile(values: list[int], ratio: float):
     return sorted(values)[max(0, math.ceil(len(values) * ratio) - 1)] if values else None
 
 
+def transport_assertion_valid(sample, code: str) -> bool:
+    """Only the archived JMX's HTTP-status assertion may explain a transport failure."""
+    expected = ("java.lang.AssertionError: unexpected HTTP status: " + code
+                + ". Expression: (prev.getResponseCode() == 200)")
+    assertions = sample.findall("assertionResult")
+    return len(assertions) == 1 and all(
+        a.findtext("name") == "Live identity and readonly contract"
+        and a.findtext("failure") == "true" and a.findtext("error") == "false"
+        and a.findtext("failureMessage") == expected for a in assertions)
+
+
 def inspect_sample(sample, context):  # pylint: disable=too-many-locals,too-many-branches
     """Validate request routing even when no HTTP response exists; never fake Schema."""
     issues, fatal = set(), set()
@@ -304,15 +315,7 @@ def inspect_sample(sample, context):  # pylint: disable=too-many-locals,too-many
         if not recognized_transport or sample.get("s") != "false":
             fatal.add("unclassified-or-inconsistent-transport-failure")
         # A known network refusal cannot hide an absent/broken Groovy assertion.
-        # This exact message comes from the first assertion in the archived JMX.
-        expected_assertion = (
-            "java.lang.AssertionError: unexpected HTTP status: " + code
-            + ". Expression: (prev.getResponseCode() == 200)")
-        assertions = sample.findall("assertionResult")
-        if len(assertions) != 1 or any(
-                a.findtext("name") != "Live identity and readonly contract"
-                or a.findtext("failure") != "true" or a.findtext("error") != "false"
-                or a.findtext("failureMessage") != expected_assertion for a in assertions):
+        if not transport_assertion_valid(sample, code):
             fatal.add("transport-live-assertion-missing-or-unexpected")
         return issues | fatal, fatal, recognized_transport, True
     if code != "200" or sample.get("s") != "true":
