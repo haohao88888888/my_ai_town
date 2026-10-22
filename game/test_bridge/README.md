@@ -1,6 +1,12 @@
-> 更新时间：2026-10-22 09:37 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-22 15:18 +08:00（Asia/Shanghai）
 
 # Opt-in GameTestBridge and isolated regression tools
+
+## Guard compatibility follow-up (2026-10-22)
+
+The authorized adapter change removes the added World public generation getter, preserving the existing architecture ratchet. The opt-in Bridge reads the same real `_runtime_generation` counter locally and rejects missing/non-positive/non-integer values rather than inventing identity. Readiness, commands, state events and active-command completion are fail-closed; existing regression projections use the same explicit check. Nine injected-context `Callable.call()` uses have individual reasons in the existing dynamic-call whitelist. No scanner, classification exclusion, baseline, protocol Schema or business format is weakened. New contract negatives are explicitly not real World evidence; a real same-object restore/old-command rejection regression is also added. These edits still require execution and final-source CI.
+
+The first formal one-client repetition on `083e352` was independently recomputed: 497 total samples, a complete 300-request/300-second window without failures, 1 successful RPS, successful p95/p99 8/9ms and ten same-engine recovery reads. The second repetition was interrupted with unclosed XML and no terminal result; 247 complete fragments do not constitute a passed run. All four original process objects have matching creation times and exit code 1 near 09:53:20, but the interruption cause is unknown. The complete 15-repetition plus stability matrix remains unfinished. A generated GUI preparation also failed parsing; omitted log redirection caused denied default-user-log write attempts. That evidence remains, the generator now specifies an owned log path, and no GUI acceptance is claimed. See [persistence compatibility and boundaries](../../docs/gametest-isolation.md); ignored local artifacts are not public CI attachments.
 
 ## Formal-entry preparation (2026-10-21)
 

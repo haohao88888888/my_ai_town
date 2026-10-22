@@ -352,9 +352,13 @@ func memory_entry(value: Node, resident: String) -> Dictionary:
 			return entry.duplicate(true)
 	return {}
 func projection(world: RefCounted, value: Node, resident: String) -> Dictionary:
+	var generation: Variant = world.get("_runtime_generation")
+	check("real-world-generation-source", generation is int and generation > 0, generation)
+	if not generation is int or generation <= 0:
+		return {}
 	return {"task": tasks(world).call("task", "phase2-state"),
 		"logs": logs(world), "memory": memory_entry(value, resident),
-		"worldRuntimeGeneration": world.call("get_runtime_generation"),
+		"worldRuntimeGeneration": generation,
 		"stateVersion": world.call("get_world_revision"),
 		"agentContext": value.call("get_agent_save_context"),
 		"worldSnapshot": world.call("create_save_snapshot"),

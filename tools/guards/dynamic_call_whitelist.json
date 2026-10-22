@@ -1,7 +1,62 @@
 {
+  "updatedAt": "2026-10-22T15:15:38+08:00",
   "version": 1,
   "note": "确属必要的动态调用，逐项记 reason（如：Callable 实例调用，非字符串派发 / 方法名来自配置）。标识与基线一致：path + func + call。",
   "entries": [
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_route",
+      "call": "variable:.call()",
+      "reason": "调用start()已校验的上下文提供者Callable获取只读HTTP路由的当前World；Callable实例调用，非字符串派发，不由请求指定方法名。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_command_context",
+      "call": "variable:.call()",
+      "reason": "调用已注入的上下文Callable校验命令的当前会话、世代与版本；Callable实例调用，非字符串派发，不改变命令白名单。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_advance_session_command",
+      "call": "variable:.call()",
+      "reason": "调用已注入的上下文Callable轮询保存/加载所属的真实Host；Callable实例调用，非字符串派发，并继续检查Host实例归属。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_finish_session_success",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable获取会话命令完成时的当前World身份；Callable实例调用，非字符串派发，世代不可得则不伪造完成元数据。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_finish_session_failure",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable记录会话失败时可取得的World身份；Callable实例调用，非字符串派发，缺失身份保留原受理回执而不造新世代。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_advance_move_command",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable校验移动的World/Runtime归属和真实世代；Callable实例调用，非字符串派发，上下文丢失时失败关闭。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_finish_move_success",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable停止受控移动并取得完成身份；Callable实例调用，非字符串派发，不能由网络请求改换回调目标。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_finish_move_failure",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable停止所属Runtime移动并保留失败回执；Callable实例调用，非字符串派发，不执行任意请求方法。"
+    },
+    {
+      "path": "game/test_bridge/GameTestBridge.gd",
+      "func": "_observe_state_version",
+      "call": "variable:.call()",
+      "reason": "调用上下文Callable观察World真实世代/状态版本并生成事件；Callable实例调用，非字符串派发，世代不可得时不发造假的状态通知。"
+    },
     {
       "path": "game/agent/model/UnavailableModelProvider.gd",
       "func": "request_decision",

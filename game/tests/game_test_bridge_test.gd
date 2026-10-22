@@ -11,6 +11,16 @@ var _flow_host: RefCounted
 var _websocket_test_buffer := PackedByteArray()
 
 
+# Contract-only malformed contexts; never counted as real World lifecycle proof.
+class WorldWithoutGeneration extends RefCounted:
+	func is_running() -> bool:
+		return true
+
+
+class WorldWithInvalidGeneration extends WorldWithoutGeneration:
+	var _runtime_generation: Variant = null
+
+
 class FakeSessionFlowHost extends RefCounted:
 	var world: RefCounted
 	var world_data: Dictionary
@@ -166,6 +176,7 @@ func _run_bridge_tests() -> void:
 	_world.call("start", data, _load_opening(data))
 	var restarted := await _exchange(_header("/world/state"))
 	_expect(restarted.get("body", {}).get("data", {}).get("worldGeneration") != snapshot_data.get("worldGeneration"), "restart of same object changes generation")
+	await _test_generation_adapter(data)
 	await _test_slow_client()
 	await _test_connection_limit()
 	await _test_event_stream()
@@ -178,6 +189,63 @@ func _run_bridge_tests() -> void:
 	if is_instance_valid(_runtime):
 		_runtime.queue_free()
 	_finish_suite("GAMETEST_BRIDGE_PASS")
+
+
+func _test_generation_adapter(data: Dictionary) -> void:
+	_bridge.stop()
+	_expect_equal(_bridge.start(_context, _port, true).get("ok"), true, "generation adapter command listener starts")
+	var real_world := _world
+	var rejected_command := _command("missing-generation-command")
+	var source_id := real_world.get_instance_id()
+	var source_generation: Variant = real_world.get("_runtime_generation")
+	_expect(source_generation is int and source_generation > 0, "real lifecycle generation is a positive integer")
+	var event_sequence: int = _bridge.get("_event_sequence")
+	_world = WorldWithoutGeneration.new()
+	_expect_error(_bridge.handle_http_header(_header("/world/state")), 503, "WORLD_NOT_READY")
+	_expect_error(_bridge.handle_http_header(_header("/events/cursor")), 503, "WORLD_NOT_READY")
+	_expect_error(_bridge.handle_http_header(_post(rejected_command)), 503, "WORLD_NOT_READY")
+	_expect_equal(_bridge.handle_http_header(_header("/health")).body.data.worldReady, false, "missing generation does not advertise a ready World")
+	_bridge.call("_observe_state_version")
+	_expect_equal(_bridge.get("_event_sequence"), event_sequence, "missing generation emits no fabricated state event")
+	for invalid: Variant in [null, "1", 1.0, true, -1, 0]:
+		_world = WorldWithInvalidGeneration.new()
+		_world.set("_runtime_generation", invalid)
+		_expect_error(_bridge.handle_http_header(_header("/world/state")), 503, "WORLD_NOT_READY")
+		_expect_error(_bridge.handle_http_header(_post(rejected_command)), 503, "WORLD_NOT_READY")
+		_expect_equal(_bridge.call("_metadata", _context(), _world), {}, "invalid generation is not coerced into identity: %s" % str(invalid))
+	_world = real_world
+	var before: Dictionary = _bridge.handle_http_header(_header("/world/state")).body.data
+	_expect_equal(before.worldGeneration, "%s:%d:%d" % [_bridge.get("_nonce"), source_id, source_generation], "wire generation uses the real counter without mutation")
+	# FakeHost is used only to exercise the receipt state machine's fail-closed branch.
+	# The actual save/restore lifecycle proof is the real World roundtrip below.
+	var pending_save := _session_command("generation-unavailable-save")
+	_expect_equal(_bridge.handle_http_header(_post_path("/commands/save", pending_save)).get("status"), 202, "save contract accepted before context becomes unavailable")
+	_world = WorldWithoutGeneration.new()
+	_flow_host.set("save_steps", 1)
+	_bridge.call("_advance_session_command")
+	var unavailable_receipt: Dictionary = _bridge.handle_http_header(_header("/commands/" + pending_save.commandId)).body.data
+	_expect_equal(unavailable_receipt.status, "failed", "active save cannot complete with unavailable generation")
+	_expect_equal(unavailable_receipt.failure.code, "SESSION_CONTEXT_LOST", "active save exposes context loss rather than fake identity")
+	_expect_equal(unavailable_receipt.worldGeneration, before.worldGeneration, "failed receipt preserves its known original identity")
+	_world = real_world
+	var saved: Dictionary = real_world.call("create_save_snapshot")
+	_expect_equal(saved.get("ok"), true, "real in-memory World snapshot captures before restore")
+	if saved.get("ok") == true:
+		var restored: Dictionary = real_world.call("restore_from_snapshot", data, _load_opening(data), saved.get("snapshot", {}))
+		_expect_equal(restored.get("ok"), true, "real in-place World restore succeeds")
+		if restored.get("ok") == true:
+			var after: Dictionary = _bridge.handle_http_header(_header("/world/state")).body.data
+			var restored_generation: Variant = real_world.get("_runtime_generation")
+			_expect_equal(real_world.get_instance_id(), source_id, "in-place restore preserves the same real World object")
+			_expect(restored_generation is int and restored_generation > source_generation, "real restore advances the native lifecycle counter")
+			_expect_equal(after.worldGeneration, "%s:%d:%d" % [_bridge.get("_nonce"), source_id, restored_generation], "restored generation comes from the same native field")
+			_expect(after.worldGeneration != before.worldGeneration, "same-object restore changes Bridge generation")
+			var stale := _command("pre-restore-generation")
+			stale.expectedWorldGeneration = before.worldGeneration
+			_expect_error(await _exchange(_post(stale)), 409, "WORLD_GENERATION_CONFLICT")
+			_expect_equal((await _exchange(_post(_command("post-restore-generation")))).get("status"), 200, "fresh restored generation executes")
+	_bridge.stop()
+	_expect_equal(_bridge.start(_context, _port).get("ok"), true, "generation adapter test restores readonly listener")
 
 
 func _command(identifier: String, speed := 2) -> Dictionary:

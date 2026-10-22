@@ -370,11 +370,12 @@ func _route(path: String) -> Dictionary:
 	var context: Dictionary = _context_provider.call() if _context_provider.is_valid() else {}
 	var world: Object = context.get("world")
 	var ready := is_instance_valid(world) and bool(world.is_running())
+	var metadata := _metadata(context, world) if ready else {}
+	ready = ready and not metadata.is_empty()
 	if path == "/health":
 		return _success({"bridgeReady": true, "worldReady": ready, "readOnly": not _commands_enabled})
 	if not ready:
 		return _failure(503, "WORLD_NOT_READY")
-	var metadata := _metadata(context, world)
 	if path == "/events/cursor":
 		# Global to this Bridge instance, including periods without subscribers.
 		# Emitted means generated/queued, NOT transmitted or acknowledged by a peer.
@@ -415,9 +416,17 @@ func _route(path: String) -> Dictionary:
 
 
 func _metadata(context: Dictionary, world: Object) -> Dictionary:
+	if not is_instance_valid(world):
+		return {}
+	# The opt-in adapter reads the same real lifecycle counter as save/restore.
+	# Keep this private coupling here, not a new production World public API.
+	# Missing/wrongly typed counters are unavailable, never an invented zero.
+	var generation: Variant = world.get("_runtime_generation")
+	if not generation is int or generation <= 0:
+		return {}
 	return {
 		"sessionId": context.get("sessionId", ""),
-		"worldGeneration": "%s:%d:%d" % [_nonce, world.get_instance_id(), world.get_runtime_generation()],
+		"worldGeneration": "%s:%d:%d" % [_nonce, world.get_instance_id(), generation],
 		"stateVersion": int(world.get_world_revision()),
 		"capturedAt": Time.get_datetime_string_from_system(true) + "Z",
 	}
@@ -461,6 +470,8 @@ func _command_context(command: Dictionary, received_at: int, max_timeout: int) -
 	if not is_instance_valid(world) or not world.is_running():
 		return {"response": _failure(503, "WORLD_NOT_READY")}
 	var metadata := _metadata(context, world)
+	if metadata.is_empty():
+		return {"response": _failure(503, "WORLD_NOT_READY")}
 	if command.expectedSessionId != metadata.sessionId:
 		return {"response": _failure(409, "SESSION_CONFLICT")}
 	if command.expectedWorldGeneration != metadata.worldGeneration:
@@ -502,6 +513,8 @@ func _set_speed(command: Dictionary, received_at: int) -> Dictionary:
 	if not bool(result.get("ok", false)):
 		return _failure(409, "WORLD_COMMAND_REJECTED")
 	var receipt := _metadata(context, world)
+	if receipt.is_empty():
+		return _failure(503, "WORLD_NOT_READY")
 	receipt.merge({"accepted": true, "commandId": command_id, "status": "completed", "result": {
 		"simulationSpeed": int(world.get_simulation_speed()), "changed": bool(result.get("changed", false)),
 	}})
@@ -717,11 +730,15 @@ func _advance_session_command() -> void:
 			var world: Object = context.get("world")
 			if not is_instance_valid(world) or not bool(world.is_running()):
 				return
+			var metadata := _metadata(context, world)
+			if metadata.is_empty():
+				_finish_session_failure("SESSION_CONTEXT_LOST")
+				return
 			_finish_session_success({
 				"slotId": String(operation.get("slotId", record.get("slotId", ""))),
 				"sessionId": String(operation.get("sessionId", "")),
 				"saveRevision": int(operation.get("saveRevision", record.get("saveRevision", 0))),
-				"worldGeneration": String(_metadata(context, world).worldGeneration),
+				"worldGeneration": String(metadata.worldGeneration),
 			})
 		"failed":
 			var failure := operation.get("failure", {}) as Dictionary
@@ -750,8 +767,11 @@ func _finish_session_success(result: Dictionary) -> void:
 	var context: Dictionary = _context_provider.call() if _context_provider.is_valid() else {}
 	var world: Object = context.get("world")
 	var receipt := record.receipt as Dictionary
-	if is_instance_valid(world) and bool(world.is_running()):
-		receipt.merge(_metadata(context, world), true)
+	var metadata := _metadata(context, world) if is_instance_valid(world) and bool(world.is_running()) else {}
+	if metadata.is_empty():
+		_finish_session_failure("SESSION_CONTEXT_LOST")
+		return
+	receipt.merge(metadata, true)
 	receipt.status = "completed"
 	receipt.result = result.duplicate(true)
 	record.receipt = receipt
@@ -797,7 +817,7 @@ func _advance_move_command() -> void:
 		return
 	var expected_metadata: Dictionary = record.receipt
 	var current_metadata := _metadata(context, world)
-	if current_metadata.sessionId != expected_metadata.sessionId or current_metadata.worldGeneration != expected_metadata.worldGeneration:
+	if current_metadata.is_empty() or current_metadata.sessionId != expected_metadata.sessionId or current_metadata.worldGeneration != expected_metadata.worldGeneration:
 		_finish_move_failure("MOVEMENT_CONTEXT_LOST")
 		return
 	var movement := runtime.get_avatar_movement_state() as Dictionary
@@ -851,8 +871,11 @@ func _finish_move_success(position: Vector2, changed: bool) -> void:
 		runtime.stop_virtual_movement_and_sync()
 	var world: Object = context.get("world")
 	var receipt: Dictionary = record.receipt
-	if is_instance_valid(world):
-		receipt.merge(_metadata(context, world), true)
+	var metadata := _metadata(context, world)
+	if metadata.is_empty():
+		_finish_move_failure("MOVEMENT_CONTEXT_LOST", position)
+		return
+	receipt.merge(metadata, true)
 	receipt.status = "completed"
 	receipt.progress.currentPosition = _json_copy(position)
 	receipt.progress.distance = position.distance_to(record.target as Vector2)
@@ -895,6 +918,8 @@ func _observe_state_version() -> void:
 	if not is_instance_valid(world) or not bool(world.is_running()):
 		return
 	var current := _metadata(context, world)
+	if current.is_empty():
+		return
 	if _last_observed_state.is_empty():
 		_last_observed_state = current
 		return

@@ -548,11 +548,15 @@ class RealHydrator extends RefCounted:
 		return driver.hydrate(agent, world, bad_after, write_fail_after)
 
 func capture_state(world: RefCounted, agent: RefCounted) -> Dictionary:
+	var generation: Variant = world.get("_runtime_generation")
+	check("real-world-generation-source", generation is int and generation > 0, generation)
+	if not generation is int or generation <= 0:
+		return {}
 	var entries := {}
 	var memory_error := FS._inventory(String(agent.get("_memory_root")), entries)
 	check("active-memory-inventory", memory_error == OK, int(memory_error))
 	return {"worldSnapshot": world.call("create_save_snapshot"),
-		"runtimeGeneration": world.call("get_runtime_generation"),
+		"runtimeGeneration": generation,
 		"worldRevision": world.call("get_world_revision"),
 		"agentContext": agent.call("get_save_context"), "agentIds": agent.call("get_active_resident_ids"),
 		"runtimeMemoryRoot": agent.get("_memory_root"), "memoryFiles": entries}

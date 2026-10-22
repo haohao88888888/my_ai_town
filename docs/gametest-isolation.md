@@ -1,4 +1,4 @@
-> 更新时间：2026-10-22 15:06:44 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-22 15:18 +08:00（Asia/Shanghai）
 
 # GameTest 持久化兼容性与隔离边界
 
@@ -31,6 +31,8 @@
 
 ## 测试与已有结果
 
+为遵守现有 World 架构棘轮，已获准撤销本 PR 新增的世代 getter。只有显式开启的 Bridge 测试适配层及既有测试投影读取同一个真实 `_runtime_generation` 字段；必须为正整数，否则不发布就绪状态、不受理命令、不伪造状态事件，活动命令以已知旧身份失败结束。此实现把内部字段名的耦合成本留在测试适配层，不是向游戏业务开放反射接口。九个已注入上下文 `Callable.call()` 在现有白名单逐项说明用途，不扩大动态方法派发、扫描排除或任何 guard 基线。新增合同负例与真实同对象恢复回归仍须实际执行，不能仅凭补丁宣称通过。
+
 - [game_test_bridge_test.gd](../game/tests/game_test_bridge_test.gd) 是本 PR 新增的 Bridge 合同回归，覆盖异步受理/完成、幂等回执、失败和世界换代等边界。其 `FakeSessionFlowHost` 只验证协议合同，不能证明真实磁盘保存或 Host 场景恢复。
 - 实际存储/保留、非空任务/日志/记忆和 Host 路线分别见 [test_bridge_read_api.py](../game/test_bridge/phase2_tests/test_bridge_read_api.py)、[test_bridge_command_api.py](../game/test_bridge/phase2_tests/test_bridge_command_api.py)；实际损坏 World/未来 Agent 拒绝与音频失败保护见 [test_bridge_host_load_failures.py](../game/test_bridge/phase2_tests/test_bridge_host_load_failures.py)。不以测试替身回执代替这些真实链路。
 - 本机完整回归索引：[closeout-audio-full-20261020-a1/closeout-audit.json](../game/test_bridge/artifacts/closeout-audio-full-20261020-a1/closeout-audit.json)。身份为干净 `f63bac2edd88d7e115a4f05a5b1d57ee18433b6c`：pytest 74 通过、零失败/错误/跳过，Godot 685 条检查，Newman 5 请求/14 断言，Pylint 10/10。检查条数不是额外 pytest 用例；该历史本机结果不能继承为当前最终 SHA 的云端通过。
@@ -46,5 +48,6 @@
 3. `TownAudioDisplaySettingsService` 是独立路径，不在音频 autoload 保护结论内；当前 GUI 夹具不创建该服务、不进入设置/全屏。真实读档、玩家交互和可视错误提示 UI 尚需补验，无头恢复不是图形验收。
 4. 保留登记是进程内单向状态；不要在同一进程撤销后转向正式根。停止已确认归属的测试子进程，保留整个隔离根；后续使用新的、另行授权的隔离产物根重新验证，不复用或覆盖失败样本。正常游戏启动不以恢复测试产物替换正式存档。
 5. 早期 JMeter 原生报告原型曾自动清理隔离派生缓存，已作为执行偏差保留记录；原 XML/CSV 哈希未变但无逐文件删除清单。因此不能声称“全过程零删除/全文件系统完全隔离”。后续报告配置避开对应清理消费者，不抹去历史偏差。
+6. 首次新 GUI 夹具因生成脚本解析失败退出；启动命令遗漏 `--log-file`，Godot 尝试写默认用户日志时被拒绝。没有 UI 通过结果，也不能据此声称未发生任何默认路径访问。该根和日志保留，生成器已改为明确的隔离日志路径，修复仍需解析及真实 UI 复验。
 
 阶段二还需按原标准补完其余压力测量、实际 UI、适用 guard、最终 CI 与总验收。上游是否合并 PR 不作为这些本机验证的完成条件。
