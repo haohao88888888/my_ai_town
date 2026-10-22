@@ -1,0 +1,26 @@
+{
+  "updatedAt": "2026-10-22T15:06:44+08:00",
+  "schemaVersion": 1,
+  "decision": "no_migration",
+  "summary": "增加显式登记的 GameTest 隔离存储与清理留证，传播测试保留失败，并使读档完成回执同步实际恢复版本；不修改世界、会话 manifest、Agent 或居民状态的存档格式与版本，不需新增数据迁移。正常启动仍使用原正式路径和清理分支；该声明不代表原物理删除、全部失败分支或历史样本迁移已通过验证。",
+  "affectedModules": [
+    "agent_filesystem_test_retention",
+    "agent_session_and_runtime_memory_cleanup",
+    "resident_and_avatar_memory_cleanup",
+    "session_save_store_and_startup_profile",
+    "conversation_photo_cleanup",
+    "game_flow_host_isolated_storage_and_load_receipt",
+    "audio_settings_isolated_storage"
+  ],
+  "migrationIds": [],
+  "samples": [
+    "game/tests/fixtures/town_world_opening.json",
+    "game/tests/fixtures/historical_saves/catalog.json"
+  ],
+  "tests": [
+    "game/tests/game_test_bridge_test.gd"
+  ],
+  "docs": [
+    "docs/gametest-isolation.md"
+  ]
+}
