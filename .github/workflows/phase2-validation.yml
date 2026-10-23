@@ -1,4 +1,4 @@
-# Updated: 2026-10-02 12:05:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-10-23 15:31:00 +08:00 (Asia/Shanghai)
 name: phase2-validation
 
 on:
@@ -74,6 +74,9 @@ jobs:
         with:
           name: phase2-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: game/test_bridge/artifacts/
+          # This isolated test root includes the intentional .hidden-proof fixture.
+          # Do not broaden this path to the checkout or user configuration.
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
 
