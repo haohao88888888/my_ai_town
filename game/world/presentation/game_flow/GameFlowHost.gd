@@ -6808,6 +6808,13 @@ func _complete_in_session_load_game(
 	if not bool(discovery.get("ok", false)):
 		_present_in_session_load_failure(discovery)
 		return
+	# Diagnostic discovery is not permission to discard the current live town.
+	var compatibility_gate := SAVE_COMPATIBILITY.restore_gate(
+		discovery.get("compatibility", {}) as Dictionary,
+	)
+	if compatibility_gate.get("ok") != true:
+		_present_in_session_load_failure(compatibility_gate)
+		return
 	if not ResourceLoader.exists(STARTUP_SCENE_PATH, "PackedScene"):
 		_present_in_session_load_failure(
 			_failure("GAME_FLOW_STARTUP_ROUTE_FAILED", false),

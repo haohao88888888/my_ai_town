@@ -1,6 +1,14 @@
-> 更新时间：2026-10-22 15:18 +08:00（Asia/Shanghai）
+> 更新时间：2026-10-24 09:54 +08:00（Asia/Shanghai）
 
 # GameTest 持久化兼容性与隔离边界
+
+## 会话内异常加载前置拒绝（2026-10-23）
+
+实际隔离 GUI 验证中，独立 `town-2` 已发布 World 样本哈希损坏后，从健康 `town-3` 点击加载会退回标题页；当前 Runtime 已释放，未见明确错误提示。源码确认诊断目录发现结果可以为 `ok=true`，不能等同于允许恢复；兼容性闸门原先直到离场后的正式 Continue 才执行。
+
+本次仅在 `_complete_in_session_load_game` 离场前复用既有 `SAVE_COMPATIBILITY.restore_gate`，拒绝结果走现有暂停菜单反馈。没有改变选档、离场保存、Provider 健康检查、恢复/迁移规则或存档格式。损坏在检查之后才发生的竞态不在这次已验证范围内。
+
+现有两项真实 Host 回归增加会话内 UI 入口集成：修复前损坏场景失败、不兼容场景通过；修复后最终定向两项通过（JUnit 78.260秒），并独立核对原件、源码、SQL/JSONL、原世界/15人Agent/非空任务日志记忆、错误反馈和原损坏字节。原 HTTP 拒绝检查保留。证据索引为本机 [in-session-preflight-independent-20261023-a1.json](../game/test_bridge/artifacts/in-session-preflight-independent-20261023-a1.json)。这是无头实际 Host/控件集成，不是修复后 GUI 黑盒验收；全量与最终三次 CI 仍待。
 
 ## 修改原因与迁移决定
 

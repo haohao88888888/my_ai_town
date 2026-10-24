@@ -1,4 +1,4 @@
-"""Real Bridge/Host rejection of isolated corrupt and future-version saves."""
+"""Updated 2026-10-23: real Bridge/Host rejection and in-session UI preflight."""
 
 from __future__ import annotations
 
@@ -124,6 +124,43 @@ _FAILURE_BODY = r'''
 \tcheck("no-extra-departure-revision", persisted.get("manifests", []).size() == 1 and persisted["manifests"][0].get("save_revision") == 1, persisted)
 \tsnapshot("host-http.json", {"requests": host_http, "events": host_events, "scenes": host_scenes,
 \t\t"cursorStart": cursor_before, "cursorEnd": cursor_after})
+\t# Exercise the real Host's UI entry separately from the HTTP contract above.
+\t# This is headless integration, not a synthetic click or GUI acceptance.
+\tflow.call("_open_pause_menu")
+\tflow.call("_open_in_session_load_game")
+\tvar pause: Node = flow.get("_pause_host")
+\tcheck("actual-in-session-load-page-mounted", is_instance_valid(pause) and String(pause.call("current_route")) == "load_game")
+\tvar ui_before := projection(runtime.call("get_world_runtime"), source, resident)
+\tui_before["allAgentPayloads"] = capture_agents(source)
+\tsnapshot("ui-before-rejection.json", ui_before)
+\tflow.call("_complete_in_session_load_game", {"slotId": "town-3"}, false)
+\tfor _frame in range(12):
+\t\tpump_host_events()
+\t\tawait process_frame
+\tvar preserved: bool = is_instance_valid(runtime) and current_scene == runtime and flow.get("_town_runtime") == runtime
+\tvar ui_result: Dictionary = flow.get("_last_result")
+\tvar ui_wanted := "SAVE_VERSION_COMBINATION_UNKNOWN" if spec["failureMode"] == "world-corrupt" else "SAVE_VERSION_NEWER_THAN_SUPPORTED"
+\tsnapshot("ui-load-result.json", {"entry": "actual GameFlowHost in-session load, no simulated GUI input", "result": ui_result,
+\t\t"sourceInstanceId": source_id, "actualScene": String(current_scene.name) if is_instance_valid(current_scene) else "",
+\t\t"oldRuntimePreserved": preserved, "pending": flow.get("_in_session_load_pending")})
+\tcheck("in-session-rejection-keeps-original-runtime-before-departure", preserved)
+\tcheck("in-session-rejection-clears-pending-and-reports-failure", flow.get("_in_session_load_pending") == false and ui_result.get("ok") == false and ui_result.get("errorCode") == ui_wanted, ui_result)
+\tif not preserved:
+\t\t# Preserve the actual failure; do not dereference or reconstruct the lost scene.
+\t\treturn
+\tvar ui_after := projection(runtime.call("get_world_runtime"), source, resident)
+\tui_after["allAgentPayloads"] = capture_agents(source)
+\tsnapshot("ui-after-rejection.json", ui_after)
+\tcheck("in-session-rejection-keeps-world-agent-task-log-memory", same(ui_before, ui_after))
+\tvar pause_screen: Control = pause.call("pause_screen")
+\tvar feedback: Dictionary = pause_screen.call("debug_snapshot")
+\tfeedback["localOperation"] = (pause_screen.get("_local_operation") as Dictionary).duplicate(true)
+\tsnapshot("ui-error-feedback.json", feedback)
+\tcheck("in-session-rejection-returns-pause-and-presents-error", String(pause.call("current_route")) == "pause_menu" and feedback["localOperation"].get("status") == "rejected" and feedback["localOperation"].get("intent") == "pause_menu.open_load_game" and not String(feedback.get("operationText", "")).strip_edges().is_empty(), feedback)
+\tvar ui_inventory := {}
+\tcheck("in-session-rejection-inventory-readable", FS._inventory(path(""), ui_inventory) == OK)
+\tcheck("in-session-rejection-no-save-or-data-change", same(after_inventory, ui_inventory) and FileAccess.get_file_as_bytes(original_path) == damaged)
+\tflow.call("_close_pause_menu")
 \tcheck("native-source-close", source.call("close_session").get("ok") == true)
 \tflow.call("_unmount_town_overlays")
 \tflow.call("_release_internal_session_refs")

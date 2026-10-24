@@ -1,4 +1,4 @@
-# Updated: 2026-10-23 15:31:00 +08:00 (Asia/Shanghai)
+# Updated: 2026-10-23 20:35:00 +08:00 (Asia/Shanghai)
 name: phase2-validation
 
 on:
@@ -68,16 +68,154 @@ jobs:
             -ExecutionMode github-actions
           exit $LASTEXITCODE
 
-      - name: Preserve reports even on failure
+      - name: Pack isolated evidence including hidden files and empty directories
+        id: pack-evidence
         if: always()
+        shell: python
+        run: |
+          import json
+          import ntpath
+          import os
+          import stat
+          import uuid
+          import zipfile
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).absolute()
+          source = workspace / 'game' / 'test_bridge' / 'artifacts'
+          temporary = Path(os.environ['RUNNER_TEMP']).absolute()
+          archive_path = temporary / (
+              f"phase2-evidence-{os.environ['GITHUB_RUN_ID']}-"
+              f"{os.environ['GITHUB_RUN_ATTEMPT']}-{uuid.uuid4().hex}.zip"
+          )
+
+          def checked(path):
+              info = path.lstat()
+              if stat.S_ISLNK(info.st_mode) or (
+                  getattr(info, 'st_file_attributes', 0)
+                  & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+              ):
+                  raise RuntimeError(f'Links/reparse points are not evidence: {path}')
+              if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                  raise RuntimeError(f'Unsupported evidence entry: {path}')
+              if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                  raise RuntimeError(f'Hard-linked evidence is not allowed: {path}')
+              if path.resolve(strict=True) != path:
+                  raise RuntimeError(f'Non-canonical evidence path: {path}')
+              return info
+
+          for root in (source, temporary):
+              for ancestor in reversed((root, *root.parents)):
+                  checked(ancestor)
+              if not root.is_dir():
+                  raise RuntimeError(f'Expected an existing directory: {root}')
+          if archive_path.is_relative_to(source) or temporary.is_relative_to(workspace):
+              raise RuntimeError('The evidence ZIP must be outside the checkout')
+          source_info = checked(source)
+
+          # This reviewed isolated root contains an intentional .hidden-proof fixture.
+          # Include it, but fail closed on configuration/credential path names.
+          forbidden = {
+              '.git', '.env', '.ssh', '.aws', '.azure', '.gnupg',
+              '.npmrc', '.pypirc', '.netrc', '_netrc',
+              'credentials', 'credentials.json', 'credentials.ini',
+              'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+          }
+          entries = []
+          links = []
+          pending = [source]
+          while pending:
+              directory = pending.pop()
+              checked(directory)
+              for path in sorted(directory.iterdir()):
+                  info = path.lstat()
+                  relative = path.relative_to(source)
+                  if any(
+                      part.casefold() in forbidden
+                      or part.casefold().startswith('.env')
+                      or part.casefold().endswith(('.pem', '.key', '.p12', '.pfx'))
+                      or ':' in part or '\\' in part
+                      for part in relative.parts
+                  ):
+                      raise RuntimeError(f'Sensitive/unsafe evidence path: {relative}')
+                  tag = getattr(info, 'st_reparse_tag', 0)
+                  if stat.S_ISLNK(info.st_mode) or (
+                      getattr(info, 'st_file_attributes', 0)
+                      & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+                  ):
+                      if tag not in (0, stat.IO_REPARSE_TAG_SYMLINK,
+                                     stat.IO_REPARSE_TAG_MOUNT_POINT):
+                          raise RuntimeError(f'Unsupported evidence reparse point: {relative}')
+                      raw_target = os.readlink(path)
+                      prefix = chr(92) * 2 + '?' + chr(92)
+                      target = raw_target
+                      if target.startswith(prefix + 'UNC' + chr(92)):
+                          target = chr(92) * 2 + target[8:]
+                      elif target.startswith(prefix):
+                          target = target[4:]
+                      lexical_target = Path(ntpath.normpath(str(path.parent / target)))
+                      links.append((path, info, {
+                          'path': f'artifacts/{relative.as_posix()}',
+                          'kind': 'junction' if tag == stat.IO_REPARSE_TAG_MOUNT_POINT else 'symlink',
+                          'reparseTag': tag, 'mode': info.st_mode,
+                          'rawTarget': raw_target,
+                          'targetScope': 'lexically-inside' if lexical_target.is_relative_to(source)
+                                         else 'lexically-outside',
+                      }))
+                      continue
+                  info = checked(path)
+                  if not path.resolve(strict=True).is_relative_to(source):
+                      raise RuntimeError(f'Evidence escaped its isolated root: {path}')
+                  entries.append((path, relative.as_posix(), info))
+                  if stat.S_ISDIR(info.st_mode):
+                      pending.append(path)
+
+          def fingerprint(info):
+              return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                      info.st_mtime_ns, info.st_nlink,
+                      getattr(info, 'st_file_attributes', 0),
+                      getattr(info, 'st_reparse_tag', 0))
+
+          # Exclusive creation preserves prior archives. Every directory gets a ZIP
+          # entry, so upload-artifact cannot discard the empty retained directories.
+          with zipfile.ZipFile(archive_path, 'x', zipfile.ZIP_DEFLATED,
+                               strict_timestamps=False) as archive:
+              archive.write(source, 'artifacts/')
+              for path, relative, original in entries:
+                  if fingerprint(checked(path)) != fingerprint(original):
+                      raise RuntimeError(f'Evidence changed before packing: {path}')
+                  archive.write(path, f'artifacts/{relative}')
+                  if fingerprint(checked(path)) != fingerprint(original):
+                      raise RuntimeError(f'Evidence changed while packing: {path}')
+              # Links are evidence of deliberate negative fixtures / pytest aliases.
+              # Record the link itself; never follow or recreate its target as a copy.
+              archive.writestr('phase2-evidence-links.json', json.dumps({
+                  'schemaVersion': 1,
+                  'targetScopeMeaning': 'Lexical only; target and its ancestors are not followed.',
+                  'links': [record for _, _, record in links],
+              }, ensure_ascii=False, indent=2) + '\n')
+          for path, _, original in [(source, '', source_info), *entries]:
+              if fingerprint(checked(path)) != fingerprint(original):
+                  raise RuntimeError(f'Evidence changed during packing: {path}')
+          for path, original, record in links:
+              if (fingerprint(path.lstat()) != fingerprint(original)
+                      or os.readlink(path) != record['rawTarget']):
+                  raise RuntimeError(f'Evidence link changed during packing: {path}')
+          with zipfile.ZipFile(archive_path) as archive:
+              if len(archive.infolist()) != len(entries) + 2 or archive.testzip():
+                  raise RuntimeError('Evidence ZIP verification failed')
+          # Publish only a complete, verified archive; partial failures stay local.
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'path={archive_path}\n')
+          print(f'Packed {len(entries)} entries and {len(links)} link records into {archive_path.name}')
+
+      - name: Preserve reports even on failure
+        if: always() && steps.pack-evidence.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: phase2-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: game/test_bridge/artifacts/
-          # This isolated test root includes the intentional .hidden-proof fixture.
-          # Do not broaden this path to the checkout or user configuration.
-          include-hidden-files: true
-          if-no-files-found: warn
+          path: ${{ steps.pack-evidence.outputs.path }}
+          if-no-files-found: error
           retention-days: 7
 
   locust-static:

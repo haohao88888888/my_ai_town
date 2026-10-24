@@ -1,8 +1,8 @@
 {
-  "updatedAt": "2026-10-22T15:06:44+08:00",
+  "updatedAt": "2026-10-24T09:54:00+08:00",
   "schemaVersion": 1,
   "decision": "no_migration",
-  "summary": "增加显式登记的 GameTest 隔离存储与清理留证，传播测试保留失败，并使读档完成回执同步实际恢复版本；不修改世界、会话 manifest、Agent 或居民状态的存档格式与版本，不需新增数据迁移。正常启动仍使用原正式路径和清理分支；该声明不代表原物理删除、全部失败分支或历史样本迁移已通过验证。",
+  "summary": "增加显式登记的 GameTest 隔离存储与清理留证，传播测试保留失败，使读档完成回执同步实际恢复版本，并在会话内加载离场前复用现有兼容性闸门拒绝不可恢复目标；不修改世界、会话 manifest、Agent 或居民状态的存档格式与版本，不需新增数据迁移。正常启动仍使用原正式路径和清理分支；该声明不代表原物理删除、全部失败分支、修复后GUI或历史样本迁移已通过验证。",
   "affectedModules": [
     "agent_filesystem_test_retention",
     "agent_session_and_runtime_memory_cleanup",
