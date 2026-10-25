@@ -551,6 +551,225 @@ func _wait_for_command(command_id: String, timeout_msec := 5000) -> Dictionary:
 	return {}
 
 
+func _open_movement_events() -> StreamPeerTCP:
+	var peer := StreamPeerTCP.new()
+	_websocket_test_buffer = PackedByteArray()
+	_expect_equal(peer.connect_to_host("127.0.0.1", _port), OK, "interruption WebSocket connects")
+	var deadline := Time.get_ticks_msec() + 5000
+	while peer.get_status() == StreamPeerTCP.STATUS_CONNECTING and Time.get_ticks_msec() < deadline:
+		peer.poll()
+		await process_frame
+	peer.put_data(_header("/events", "GET", "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n").to_utf8_buffer())
+	var handshake := PackedByteArray()
+	while handshake.get_string_from_ascii().find("\r\n\r\n") < 0 and Time.get_ticks_msec() < deadline:
+		peer.poll()
+		if peer.get_available_bytes() > 0:
+			handshake.append_array(peer.get_data(peer.get_available_bytes())[1])
+		await process_frame
+	_expect(handshake.get_string_from_ascii().begins_with("HTTP/1.1 101 Switching Protocols"), "interruption receives real WebSocket upgrade")
+	var header_end := handshake.get_string_from_ascii().find("\r\n\r\n")
+	if header_end >= 0:
+		_websocket_test_buffer = handshake.slice(header_end + 4)
+	return peer
+
+
+func _interruption_snapshot() -> Dictionary:
+	var player := _runtime.get("_player") as CharacterBody2D
+	var virtual_input: Object = _runtime.get("_mobile_movement_input")
+	if not is_instance_valid(player) or not is_instance_valid(virtual_input):
+		_expect(false, "interruption fixture exposes its actual player and virtual input")
+	return {"movement": _runtime.call("get_avatar_movement_state"),
+		"virtualInput": virtual_input.call("merged_with", Vector2.ZERO) if is_instance_valid(virtual_input) else null,
+		"velocity": player.velocity if is_instance_valid(player) else null,
+		"runtimeInstanceId": _runtime.get_instance_id(), "worldInstanceId": _world.get_instance_id(),
+		"activeCommandId": _bridge.get("_active_move_id"), "physicsFrame": Engine.get_physics_frames(), "observedAtMsec": Time.get_ticks_msec(),
+		"worldResponse": _bridge.handle_http_header(_header("/world/state"))}
+
+
+func _trace_interruption(case_id: String, step_id: String, command: Dictionary, details: Dictionary) -> void:
+	# Evidence IDs name test records; only real WS envelopes carry game eventSequence.
+	print("GAMETEST_MOVE_INTERRUPTION " + JSON.stringify(_bridge.call("_json_copy", {
+		"testEvidenceId": case_id + ":" + step_id, "caseId": case_id, "stepId": step_id,
+		"command": command, "details": details, "snapshot": _interruption_snapshot(),
+		"gameEventSequence": (details.get("event", {}) as Dictionary).get("eventSequence"),
+		"failureCount": _failures.size(), "observedAtMsec": Time.get_ticks_msec()})))
+
+
+func _interruption_response_data(response: Dictionary) -> Dictionary:
+	var body: Variant = response.get("body")
+	var data: Variant = body.get("data") if body is Dictionary else null
+	_expect(data is Dictionary, "interruption response has an object payload: %s" % [response])
+	return data as Dictionary if data is Dictionary else {}
+
+
+func _drain_interruption_events(peer: StreamPeerTCP) -> Array[Dictionary]:
+	var events: Array[Dictionary] = []
+	peer.poll()
+	_expect_equal(peer.get_status(), StreamPeerTCP.STATUS_CONNECTED, "interruption subscription stays connected before event drain")
+	var deadline := Time.get_ticks_msec() + 1000
+	while Time.get_ticks_msec() < deadline and events.size() < 64:
+		peer.poll()
+		if _websocket_test_buffer.is_empty() and peer.get_available_bytes() == 0:
+			await process_frame
+			continue
+		var event := await _read_websocket_event(peer)
+		_expect(not event.is_empty(), "interruption pending bytes decode to an actual event")
+		if event.is_empty():
+			break
+		events.append(event)
+	_expect(events.size() < 64, "interruption event drain finishes within its bounded budget")
+	peer.poll()
+	_expect_equal(peer.get_status(), StreamPeerTCP.STATUS_CONNECTED, "interruption subscription stays connected after event drain")
+	return events
+
+
+func _expect_interrupted_movement_stopped(case_id: String) -> Dictionary:
+	var snapshot := _interruption_snapshot()
+	var origin: Vector2 = snapshot.movement.position
+	var greatest_drift := 0.0
+	var frames: Array[Dictionary] = []
+	for _frame in 12:
+		await physics_frame
+		var current := _interruption_snapshot()
+		frames.append(current)
+		greatest_drift = maxf(greatest_drift, (current.movement.position as Vector2).distance_to(origin))
+		_expect_equal(current.virtualInput, Vector2.ZERO, case_id + " keeps virtual input released")
+		_expect_equal(current.velocity, Vector2.ZERO, case_id + " keeps player velocity zero")
+	_expect(greatest_drift <= 0.25, case_id + " remains stationary with controls restored")
+	_expect_equal(_bridge.get("_active_move_id"), "", case_id + " releases active command slot")
+	return {"initial": snapshot, "frames": frames, "greatestDrift": greatest_drift}
+
+
+func _test_running_move_interruption(kind: String, expected_code: String) -> void:
+	var case_id := "move-interrupt-" + kind
+	var peer := await _open_movement_events()
+	var state := _runtime.call("get_avatar_movement_state") as Dictionary
+	_expect(state.avatarMode == "avatar_active" and state.present and state.movementInputEnabled and not state.paused, case_id + " starts with live controls")
+	var origin := state.position as Vector2
+	var target := _choose_clear_target(origin, 144.0)
+	_expect(target.is_finite(), case_id + " has a legal distant target")
+	if not target.is_finite():
+		peer.disconnect_from_host()
+		return
+	var command := _move_command(case_id, target, 5000)
+	# Same real handler, no await/version race before accepting; WS/queries use TCP.
+	var accepted := _bridge.handle_http_header(_post_path("/commands/move-player", command)) as Dictionary
+	_trace_interruption(case_id, "accepted", command, {"transport": "in-process-http-handler", "response": accepted})
+	_expect_equal(accepted.get("status"), 202, case_id + " is accepted before interruption")
+	if accepted.get("status") != 202:
+		peer.disconnect_from_host()
+		return
+	_expect_equal(_interruption_response_data(accepted).get("status"), "running", case_id + " acceptance is running")
+	for _frame in 12:
+		await physics_frame
+		state = _runtime.call("get_avatar_movement_state") as Dictionary
+		if (state.position as Vector2).distance_to(origin) > 1.0:
+			break
+	var record := (_bridge.get("_commands") as Dictionary).get(command.commandId, {}) as Dictionary
+	var still_running: bool = (record.get("receipt", {}) as Dictionary).get("status") == "running"
+	var advanced: bool = (state.position as Vector2).distance_to(origin) > 1.0
+	var unfinished: bool = (state.position as Vector2).distance_to(target) > float(command.tolerance)
+	var has_budget: bool = int(record.get("deadline", 0)) - Time.get_ticks_msec() > 1000
+	_trace_interruption(case_id, "before-interrupt", command, {"receipt": record.get("receipt"), "advanced": advanced, "unfinished": unfinished, "remainingMsec": int(record.get("deadline", 0)) - Time.get_ticks_msec()})
+	_expect(still_running and advanced and unfinished and has_budget, case_id + " interrupts actual unfinished movement, not a timeout or pre-acceptance rejection")
+	if not (still_running and advanced and unfinished and has_budget):
+		await _wait_for_command(command.commandId)
+		peer.disconnect_from_host()
+		return
+	var injected: Dictionary
+	match kind:
+		"pause": injected = _world.call("pause", "manual") as Dictionary
+		"exit": injected = _runtime.call("exit_avatar_mode") as Dictionary
+		"input": injected = _runtime.call("set_avatar_movement_input_enabled", false) as Dictionary
+	_expect_equal(injected.get("ok"), true, case_id + " uses a successful real interruption entry")
+	if kind != "exit":
+		_expect_equal(injected.get("changed"), true, case_id + " changes the requested control setting")
+	state = _runtime.call("get_avatar_movement_state") as Dictionary
+	_expect(state.paused if kind == "pause" else (not state.present and state.avatarMode == "observer") if kind == "exit" else not state.movementInputEnabled, case_id + " interruption changes actual control state")
+	var failed := await _wait_for_command(command.commandId, 2000)
+	_expect_equal(failed.get("status"), "failed", case_id + " reaches terminal failure")
+	var failure: Variant = failed.get("failure")
+	_expect_equal(failure.get("code") if failure is Dictionary else null, expected_code, case_id + " has its exact interruption cause")
+	# Compare the complete wire representation, not native doubles versus parsed JSON.
+	var wire_failed := JSON.parse_string(JSON.stringify(failed)) as Dictionary
+	var stopped := _interruption_snapshot()
+	_expect_equal(stopped.virtualInput, Vector2.ZERO, case_id + " terminal failure releases virtual input immediately")
+	_expect_equal(stopped.velocity, Vector2.ZERO, case_id + " terminal failure stops actual player velocity")
+	_expect_equal(stopped.activeCommandId, "", case_id + " terminal failure releases the active slot")
+	var observed_events: Array[Dictionary] = []
+	var event: Dictionary = {}
+	for _attempt in 24:
+		var received := await _read_websocket_event(peer)
+		if received.is_empty():
+			break
+		observed_events.append(received)
+		if received.get("commandId") == command.commandId and received.get("eventType") == "command-failed":
+			event = received
+			break
+	_trace_interruption(case_id, "failed", command, {"injected": injected, "receipt": failed, "event": event})
+	_expect_equal(event.get("eventType"), "command-failed", case_id + " receives terminal WS event")
+	_expect_equal(event.get("commandId"), command.commandId, case_id + " event identifies original command")
+	_expect_equal(event.get("commandType"), "move-player", case_id + " event identifies real movement")
+	for key in ["sessionId", "worldGeneration", "stateVersion", "capturedAt", "failure"]:
+		_expect_equal(event.get(key), failed.get(key), case_id + " event matches terminal " + key)
+	var sequence: Variant = event.get("eventSequence")
+	_expect((sequence is int or sequence is float) and is_finite(float(sequence)) and float(sequence) == floor(float(sequence)) and sequence > 0 and sequence <= 9007199254740991 and not String(event.get("eventId", "")).is_empty(), case_id + " has a real integral JSON game event identity")
+	var queried := await _exchange(_header("/commands/" + command.commandId))
+	_expect_equal(queried.get("status"), 200, case_id + " terminal receipt is queryable over TCP")
+	_expect_equal(_interruption_response_data(queried), wire_failed, case_id + " query preserves the full wire receipt")
+	var restored: Dictionary
+	match kind:
+		"pause": restored = _world.call("resume", "manual") as Dictionary
+		"input": restored = _runtime.call("set_avatar_movement_input_enabled", true) as Dictionary
+		"exit":
+			await process_frame # Let the formal deferred observer-view restoration finish.
+			restored = _runtime.call("enter_avatar_mode") as Dictionary
+			_expect_equal(restored.get("ok"), true, case_id + " re-enters through formal avatar descent")
+			restored = _runtime.call("complete_avatar_descent") as Dictionary
+	_expect_equal(restored.get("ok"), true, case_id + " restores controls through existing entry")
+	if kind != "exit":
+		_expect_equal(restored.get("changed"), true, case_id + " actively restores the requested control setting")
+	await physics_frame
+	state = _runtime.call("get_avatar_movement_state") as Dictionary
+	_expect(state.avatarMode == "avatar_active" and state.present and state.movementInputEnabled and not state.paused, case_id + " observes restored active controls")
+	var restored_stop := await _expect_interrupted_movement_stopped(case_id)
+	_trace_interruption(case_id, "restored", command, {"receipt": failed, "queryResponse": queried, "restored": restored, "stopObservation": restored_stop})
+	var replayed := await _exchange(_post_path("/commands/move-player", command))
+	_expect_equal(replayed.get("status"), 200, case_id + " original stale request replays terminal failure")
+	_expect_equal(_interruption_response_data(replayed), wire_failed, case_id + " retry preserves the complete wire receipt")
+	var replay_body: Variant = replayed.get("body")
+	_expect(replay_body is Dictionary and not String(replay_body.get("requestId", "")).is_empty() and accepted.body.requestId != replay_body.requestId, case_id + " retries have distinct actual HTTP request IDs")
+	var replay_stop := await _expect_interrupted_movement_stopped(case_id)
+	_trace_interruption(case_id, "replayed", command, {"response": replayed, "stopObservation": replay_stop})
+	var restart_origin := (_runtime.call("get_avatar_movement_state") as Dictionary).position as Vector2
+	var restart_target := _choose_clear_target(restart_origin, 48.0)
+	_expect(restart_target.is_finite(), case_id + " recovery has a legal new target")
+	if restart_target.is_finite():
+		var successor := _move_command(case_id + "-successor", restart_target, 5000)
+		var next_response := _bridge.handle_http_header(_post_path("/commands/move-player", successor)) as Dictionary
+		_expect_equal(next_response.get("status"), 202, case_id + " released slot accepts a distinct command")
+		_expect_equal(_interruption_response_data(next_response).get("status"), "running", case_id + " successor is asynchronous")
+		var completed := await _wait_for_command(successor.commandId)
+		_expect_equal(completed.get("status"), "completed", case_id + " successor completes physical movement")
+		var finish := (_runtime.call("get_avatar_movement_state") as Dictionary).position as Vector2
+		_expect(finish.distance_to(restart_origin) > 1.0 and finish.distance_to(restart_target) <= float(successor.tolerance) + 1.0, case_id + " recovery is actual movement, not just a receipt")
+		_trace_interruption(case_id, "successor", successor, {"response": next_response, "receipt": completed})
+	var final_query := await _exchange(_header("/commands/" + command.commandId))
+	_expect_equal(final_query.get("status"), 200, case_id + " original receipt remains queryable after recovery")
+	_expect_equal(_interruption_response_data(final_query), wire_failed, case_id + " successor does not overwrite original receipt")
+	var native_receipt: Variant = ((_bridge.get("_commands") as Dictionary).get(command.commandId, {}) as Dictionary).get("receipt")
+	_expect_equal(native_receipt, failed, case_id + " native terminal receipt also remains exactly immutable")
+	observed_events.append_array(await _drain_interruption_events(peer))
+	var terminal_count := 0
+	for observed: Dictionary in observed_events:
+		if observed.get("commandId") == command.commandId and observed.get("eventType") in ["command-failed", "command-completed"]:
+			terminal_count += 1
+			_expect_equal(observed.get("eventType"), "command-failed", case_id + " original command never completes after interruption")
+	_expect_equal(terminal_count, 1, case_id + " publishes exactly one original terminal event, including after retry")
+	_trace_interruption(case_id, "events", command, {"events": observed_events, "terminalCount": terminal_count, "finalQueryResponse": final_query, "nativeReceipt": native_receipt})
+	peer.disconnect_from_host()
+
+
 func _test_real_player_movement() -> void:
 	_bridge.stop()
 	_bridge.free()
@@ -647,6 +866,8 @@ func _test_real_player_movement() -> void:
 		((_runtime.call("get_avatar_movement_state") as Dictionary).position as Vector2).distance_to(timeout_stop) <= 0.25,
 		"timed-out movement clears virtual input",
 	)
+	for interruption: Array in [["pause", "WORLD_PAUSED"], ["exit", "AVATAR_NOT_ACTIVE"], ["input", "AVATAR_MOVEMENT_BLOCKED"]]:
+		await _test_running_move_interruption(interruption[0], interruption[1])
 	finish = (_runtime.call("get_avatar_movement_state") as Dictionary).position as Vector2
 	_world.call("pause", "manual")
 	var pause_target := _choose_clear_target(finish, 48.0)
